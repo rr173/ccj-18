@@ -75,11 +75,18 @@ def _lazy_expire(conn: sqlite3.Connection, ticket: sqlite3.Row, now: str) -> boo
 
 
 def appointment_info(conn: sqlite3.Connection, code: str) -> Optional[dict]:
-    """核销时附加的批次/同行人数信息（门点据此核对整组访客）。"""
+    """核销时附加的批次/同行人数信息（门点据此核对整组访客）。
+
+    附带申请当前变更版本（change_version）、同行人名单，以及该票若为
+    变更换发出来的新票，给出被替换的旧票号与替换原因；若为被替换掉
+    的旧票，给出新票号（门点可明确告知“请扫新票”）。
+    """
     row = conn.execute(
-        """SELECT t.batch_id, t.application_id, t.party_size,
+        """SELECT t.batch_id, t.application_id, t.party_size, t.replaced_code,
+                  t.replacement_reason, t.replaced_by_code,
                   b.name AS batch_name, b.visit_date, b.zone_id,
-                  a.name AS applicant_name, a.status AS application_status
+                  a.name AS applicant_name, a.status AS application_status,
+                  a.change_version, a.companion_names
              FROM tickets t
              LEFT JOIN batches b ON b.id = t.batch_id
              LEFT JOIN applications a ON a.id = t.application_id
@@ -88,7 +95,11 @@ def appointment_info(conn: sqlite3.Connection, code: str) -> Optional[dict]:
     ).fetchone()
     if row is None or row["batch_id"] is None:
         return None
-    return {
+    try:
+        companion_names = json.loads(row["companion_names"] or "[]")
+    except json.JSONDecodeError:
+        companion_names = []
+    info = {
         "batch_id": row["batch_id"],
         "batch_name": row["batch_name"],
         "visit_date": row["visit_date"],
@@ -97,7 +108,15 @@ def appointment_info(conn: sqlite3.Connection, code: str) -> Optional[dict]:
         "applicant_name": row["applicant_name"],
         "application_status": row["application_status"],
         "party_size": row["party_size"],
+        "change_version": row["change_version"],
+        "companion_names": companion_names,
     }
+    if row["replaced_code"]:
+        info["replaced_code"] = row["replaced_code"]
+        info["replacement_reason"] = row["replacement_reason"]
+    if row["replaced_by_code"]:
+        info["replaced_by_code"] = row["replaced_by_code"]
+    return info
 
 
 # ---------------- 门点 ----------------
@@ -379,11 +398,15 @@ def _issue_ticket_locked(
     batch_id: Optional[str] = None,
     application_id: Optional[str] = None,
     party_size: Optional[int] = None,
+    replaced_code: Optional[str] = None,
+    replacement_reason: Optional[str] = None,
 ) -> tuple[str, int]:
     """已在 IMMEDIATE 事务内：插入票并写 TICKET_ISSUED 事件，返回 (code, version)。
 
     供管理端直接发票，也供预约审核/补录在同一事务内签票使用，
     保证“审核通过”与“票存在且与批次分区一致”原子可见。
+    申请变更换发时 ``replaced_code`` 指向被原子撤销的旧票，
+    ``replacement_reason`` 记录旧票替换原因（变更说明）。
     """
     now = iso(utcnow())
     zone_list = list(zones or [])
@@ -391,11 +414,11 @@ def _issue_ticket_locked(
     conn.execute(
         """INSERT INTO tickets
                (code,person_id,valid_from,valid_until,issued_at,status,note,zones,
-                batch_id,application_id,party_size)
-           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?)""",
+                batch_id,application_id,party_size,replaced_code,replacement_reason)
+           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?)""",
         (code, person_id, valid_from, valid_until, now, note,
          json.dumps(zone_list, ensure_ascii=False),
-         batch_id, application_id, party_size),
+         batch_id, application_id, party_size, replaced_code, replacement_reason),
     )
     payload = {
         "valid_from": valid_from,
@@ -407,6 +430,9 @@ def _issue_ticket_locked(
         payload["batch_id"] = batch_id
         payload["application_id"] = application_id
         payload["party_size"] = party_size
+    if replaced_code is not None:
+        payload["replaced_code"] = replaced_code
+        payload["replacement_reason"] = replacement_reason
     version = add_event(
         conn,
         "TICKET_ISSUED",
@@ -451,12 +477,14 @@ def _revoke_ticket_locked(
     reason: str,
     now: Optional[str] = None,
     event_reason: Optional[str] = None,
+    replaced_by_code: Optional[str] = None,
 ) -> tuple[Optional[sqlite3.Row], str]:
     """已在 IMMEDIATE 事务内：作废一张 ACTIVE 票并写事件。
 
     返回 (ticket_row_or_None, state)，state ∈
     ``ok`` / ``not_found`` / ``terminal``。供预约取消在同事务内
-    撤销已签发的票（随后才把名额释放给候补）。
+    撤销已签发的票（随后才把名额释放给候补），也供申请变更审核通过时
+    在同事务内撤销旧票（``replaced_by_code`` 记录原子换发的新票号）。
     """
     now = now or iso(utcnow())
     ticket = conn.execute(
@@ -479,15 +507,17 @@ def _revoke_ticket_locked(
         ticket_code=code,
         person_id=ticket["person_id"],
         reason=reason or "admin_revoke",
-        payload={"reason": reason},
+        payload={"reason": reason,
+                 **({"replaced_by_code": replaced_by_code} if replaced_by_code else {})},
         batch_id=ticket["batch_id"],
         application_id=ticket["application_id"],
     )
     conn.execute(
         """UPDATE tickets
-              SET status='REVOKED', revoked_at=?, revoked_reason=?
+              SET status='REVOKED', revoked_at=?, revoked_reason=?,
+                  replaced_by_code=COALESCE(?, replaced_by_code)
             WHERE code=?""",
-        (now, reason, code),
+        (now, reason, replaced_by_code, code),
     )
     return conn.execute("SELECT * FROM tickets WHERE code=?", (code,)).fetchone(), "ok"
 
@@ -728,6 +758,13 @@ def redeem(
                         "revoked_at": ticket["revoked_at"],
                         "revoked_reason": ticket["revoked_reason"],
                     }
+                    # 被变更换发所替换的旧票：明确告知门点新票号，引导扫新票
+                    if ticket["replaced_by_code"]:
+                        response["replaced_by_code"] = ticket["replaced_by_code"]
+                        response["replacement_reason"] = ticket["replacement_reason"]
+                        response["reason_text"] = (
+                            f"该票已因申请变更被替换，请改扫新票 {ticket['replaced_by_code']}"
+                        )
                     http_status = 410
                 else:  # EXPIRED
                     response = {
@@ -786,6 +823,7 @@ def redeem(
 
 BATCH_PREFIX = "B-"
 APP_PREFIX = "A-"
+CHANGE_PREFIX = "C-"
 _TOKEN_BYTES = 12
 
 
@@ -795,6 +833,10 @@ def _gen_batch_id(conn: sqlite3.Connection) -> str:
 
 def _gen_app_id(conn: sqlite3.Connection) -> str:
     return APP_PREFIX + secrets.token_hex(5).upper()
+
+
+def _gen_change_id(conn: sqlite3.Connection) -> str:
+    return CHANGE_PREFIX + secrets.token_hex(5).upper()
 
 
 def _new_token() -> str:
@@ -817,8 +859,21 @@ def batch_dict(row: sqlite3.Row, *, used: Optional[int] = None,
 
 def app_dict(row: sqlite3.Row, *, waitlist_position: Optional[int] = None) -> dict:
     d = dict(row)
+    try:
+        d["companion_names"] = json.loads(d.get("companion_names") or "[]")
+    except json.JSONDecodeError:
+        d["companion_names"] = []
     if waitlist_position is not None:
         d["waitlist_position"] = waitlist_position
+    return d
+
+
+def change_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    try:
+        d["new_companion_names"] = json.loads(d.get("new_companion_names") or "[]")
+    except json.JSONDecodeError:
+        d["new_companion_names"] = []
     return d
 
 
@@ -1007,6 +1062,50 @@ def _promote_waitlist(
     return promoted
 
 
+def _finalize_pending_changes(
+    conn: sqlite3.Connection,
+    app: sqlite3.Row,
+    status: str,
+    *,
+    reason: str,
+    now: str,
+) -> list[str]:
+    """在写事务内：把某申请名下所有 PENDING 变更置为终态（不产生任何票）。
+
+    申请被拒绝/取消/过期时联动调用：待审核变更失去意义，随之
+    REJECTED/CANCELLED/EXPIRED，并写对应事件（门点按版本可见）。
+    """
+    rows = conn.execute(
+        "SELECT * FROM application_changes WHERE application_id=? AND status='PENDING'",
+        (app["id"],),
+    ).fetchall()
+    event_type = {
+        "REJECTED": "APPLICATION_CHANGE_REJECTED",
+        "CANCELLED": "APPLICATION_CHANGE_CANCELLED",
+        "EXPIRED": "APPLICATION_CHANGE_EXPIRED",
+    }[status]
+    out: list[str] = []
+    for ch in rows:
+        conn.execute(
+            """UPDATE application_changes
+                  SET status=?, decided_at=?, decide_reason=?
+                WHERE id=? AND status='PENDING'""",
+            (status, now, reason, ch["id"]),
+        )
+        add_event(
+            conn,
+            event_type,
+            ts=now,
+            batch_id=app["batch_id"],
+            application_id=app["id"],
+            person_id=app["id"],
+            reason=reason,
+            payload={"change_id": ch["id"], "change_seq": ch["change_seq"]},
+        )
+        out.append(ch["id"])
+    return out
+
+
 def submit_application(
     conn: sqlite3.Connection,
     *,
@@ -1015,20 +1114,27 @@ def submit_application(
     name: str,
     contact: str,
     companions: int,
+    companion_names: Optional[list[str]] = None,
 ) -> dict:
     """访客通过一次性申请链接提交申请（公开端点，无管理员令牌）。
 
     幂等：request_id 唯一约束 + 写事务内复查；同一请求重放返回首次结果
     （replayed=True），同 request_id 不同载荷 -> 409 语义。
+    companion_names 为同行人姓名名单（长度需等于 companions），用于门点
+    核对整组访客；名单长度不一致 -> 400。
     """
     now = iso(utcnow())
     party_size = companions + 1
+    names = _normalize_companion_names(companion_names, companions)
+    if isinstance(names, dict):  # 校验错误报文
+        return names
+    names_json = json.dumps(names, ensure_ascii=False)
     # 事务前快速命中重放（绝大多数重复提交走这里）
     prior = conn.execute(
         "SELECT * FROM applications WHERE request_id=?", (request_id,)
     ).fetchone()
     if prior is not None:
-        mismatch = _replay_mismatch(prior, name, contact, companions)
+        mismatch = _replay_mismatch(prior, name, contact, companions, names)
         if mismatch:
             return mismatch
         return _submit_reply(conn, prior, replayed=True)
@@ -1038,7 +1144,7 @@ def submit_application(
             "SELECT * FROM applications WHERE request_id=?", (request_id,)
         ).fetchone()
         if prior is not None:
-            mismatch = _replay_mismatch(prior, name, contact, companions)
+            mismatch = _replay_mismatch(prior, name, contact, companions, names)
             if mismatch:
                 return mismatch
             return _submit_reply(conn, prior, replayed=True)
@@ -1064,10 +1170,10 @@ def submit_application(
         conn.execute(
             """INSERT INTO applications
                    (id,batch_id,seq,name,contact,party_size,companions,status,
-                    source,request_id,manage_token,created_at)
-               VALUES (?,?,?,?,?,?,?,?,'visitor',?,?,?)""",
+                    source,request_id,manage_token,created_at,companion_names)
+               VALUES (?,?,?,?,?,?,?,?,'visitor',?,?,?,?)""",
             (app_id, batch["id"], seq, name, contact, party_size, companions,
-             status, request_id, manage_token, now),
+             status, request_id, manage_token, now, names_json),
         )
         add_event(
             conn,
@@ -1081,6 +1187,7 @@ def submit_application(
                 "name": name,
                 "party_size": party_size,
                 "companions": companions,
+                "companion_names": names,
                 "seq": seq,
                 "status": status,
             },
@@ -1097,8 +1204,27 @@ def submit_application(
     return result
 
 
+def _normalize_companion_names(
+    companion_names: Optional[list[str]], companions: int
+) -> list[str] | dict:
+    """校验并规整同行人名单：长度必须等于同行人数（0 人时应为空名单）。"""
+    if companion_names is None:
+        return [""] * companions
+    if not isinstance(companion_names, list):
+        return {"http_status": 400, "error": "companion_names 必须是字符串数组"}
+    names = [str(x).strip() for x in companion_names]
+    if len(names) != companions:
+        return {"http_status": 400,
+                "error": f"同行人名单数量 {len(names)} 与同行人数 {companions} 不一致"}
+    return names
+
+
 def _replay_mismatch(
-    prior: sqlite3.Row, name: str, contact: str, companions: int
+    prior: sqlite3.Row,
+    name: str,
+    contact: str,
+    companions: int,
+    companion_names: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """同 request_id 但载荷关键内容不一致：明确报冲突，不做覆盖。"""
     if (prior["name"] != name or prior["contact"] != contact
@@ -1108,6 +1234,17 @@ def _replay_mismatch(
             "error": "request_id 已用于内容不同的申请（幂等键冲突）",
             "application_id": prior["id"],
         }
+    if companion_names is not None:
+        try:
+            prior_names = json.loads(prior["companion_names"] or "[]")
+        except json.JSONDecodeError:
+            prior_names = []
+        if prior_names != companion_names:
+            return {
+                "http_status": 409,
+                "error": "request_id 已用于同行人名单不同的申请（幂等键冲突）",
+                "application_id": prior["id"],
+            }
     return None
 
 
@@ -1210,6 +1347,8 @@ def approve_application(
             payload={
                 "name": app["name"],
                 "party_size": app["party_size"],
+                "companion_names": json.loads(app["companion_names"] or "[]"),
+                "change_version": app["change_version"],
                 "ticket_code": code,
                 "ticket_version": ticket_version,
                 "zone_id": batch["zone_id"],
@@ -1272,6 +1411,8 @@ def reject_application(
                      "from_status": app["status"]},
         )
         promoted = _promote_waitlist(conn, batch_id=app["batch_id"], now=now) if held else []
+        _finalize_pending_changes(
+            conn, app, "CANCELLED", reason="application_rejected", now=now)
         row = get_application(conn, app["id"])
     return {"http_status": 200, "application": app_dict(row),
             "promoted": promoted}
@@ -1340,6 +1481,8 @@ def cancel_application(
             },
         )
         promoted = _promote_waitlist(conn, batch_id=app["batch_id"], now=now) if held else []
+        _finalize_pending_changes(
+            conn, app, "CANCELLED", reason="application_cancelled", now=now)
         row = get_application(conn, app["id"])
     return {"http_status": 200, "application": app_dict(row),
             "ticket_revoked": ticket_revoke, "promoted": promoted}
@@ -1354,6 +1497,7 @@ def backfill_application(
     companions: int,
     reason: Optional[str] = None,
     approve: bool = True,
+    companion_names: Optional[list[str]] = None,
 ) -> dict:
     """管理员补录：source='admin'，默认直接审核通过并签票。
 
@@ -1362,6 +1506,10 @@ def backfill_application(
     """
     now = iso(utcnow())
     party_size = companions + 1
+    names = _normalize_companion_names(companion_names, companions)
+    if isinstance(names, dict):
+        return names
+    names_json = json.dumps(names, ensure_ascii=False)
     with write_tx(conn):
         batch = get_batch(conn, batch_id)
         if batch is None:
@@ -1385,10 +1533,10 @@ def backfill_application(
         conn.execute(
             """INSERT INTO applications
                    (id,batch_id,seq,name,contact,party_size,companions,status,
-                    source,request_id,manage_token,created_at)
-               VALUES (?,?,?,?,?,?,?,?,'admin',NULL,?,?)""",
+                    source,request_id,manage_token,created_at,companion_names)
+               VALUES (?,?,?,?,?,?,?,?,'admin',NULL,?,?,?)""",
             (app_id, batch_id, seq, name, contact, party_size, companions,
-             status, _new_token(), now),
+             status, _new_token(), now, names_json),
         )
         add_event(
             conn,
@@ -1399,7 +1547,8 @@ def backfill_application(
             person_id=app_id,
             reason="admin_backfill",
             payload={"name": name, "party_size": party_size,
-                     "companions": companions, "seq": seq, "status": status},
+                     "companions": companions, "companion_names": names,
+                     "seq": seq, "status": status},
         )
 
         ticket_row = None
@@ -1575,7 +1724,516 @@ def public_application_view(
         ).fetchone()
         if t is not None:
             d["ticket"] = ticket_dict(t)
+    pending = get_pending_change(conn, row["id"])
+    if pending is not None:
+        d["pending_change"] = change_dict(pending)
+    d["changes"] = list_changes(conn, application_id=row["id"])
     return d
+
+
+# ---------------- 申请变更（姓名 / 联系方式 / 同行人数及名单） ----------------
+#
+# 变更流程与不变量（全部在 BEGIN IMMEDIATE 写事务内串行完成）：
+#   * 访客凭申请的 manage_token 提交变更（公开端点），request_id 唯一约束
+#     保证重复提交幂等（重放返回首次结果，同键不同载荷 409）；每个申请
+#     同时只允许一个 PENDING 变更。
+#   * 只有“活的”申请可变更：CANCELLED/REJECTED/EXPIRED 拒绝；票已核销
+#     （访客已到场）的 APPROVED 申请一律拒绝，任何路径都不能再变更。
+#   * 管理员审核通过：
+#       - PENDING/WAITLISTED：改写申请资料（姓名/联系方式/人数/名单），
+#         不签发任何票；随后按“新总人数”重新判定候补：缩小即 FIFO 晋级
+#         释放出的名额，放大但放不下则其名次按原提交序保留（由 _used_seats
+#         实时读取新 party_size，所有容量计算天然按新人数重排）。
+#       - APPROVED：先在同一事务内判定新总人数不超容量（并发多个变更由
+#         IMMEDIATE 串行，第二个看到含第一个的新占用，放不下 409），再
+#         原子“撤销旧票 + 签发新票”：旧票 REVOKED 并记新票号/替换原因，
+#         新票 ACTIVE 并记旧票号；两者与申请更新、事件写入同提交，任何
+#         中间崩溃都不会出现无票或两张可用票。
+#   * 拒绝/撤回/过期的变更：不改申请、不动旧票、不产生可用票。
+
+def get_change(conn: sqlite3.Connection, change_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM application_changes WHERE id=?", (change_id,)
+    ).fetchone()
+
+
+def get_change_by_request_id(
+    conn: sqlite3.Connection, request_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM application_changes WHERE request_id=?", (request_id,)
+    ).fetchone()
+
+
+def get_pending_change(
+    conn: sqlite3.Connection, application_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM application_changes WHERE application_id=? AND status='PENDING'",
+        (application_id,),
+    ).fetchone()
+
+
+def _application_ticket_state(
+    conn: sqlite3.Connection, app: sqlite3.Row
+) -> Optional[sqlite3.Row]:
+    if not app["ticket_code"]:
+        return None
+    return conn.execute(
+        "SELECT * FROM tickets WHERE code=?", (app["ticket_code"],)
+    ).fetchone()
+
+
+def submit_application_change(
+    conn: sqlite3.Connection,
+    *,
+    manage_token: str,
+    request_id: str,
+    name: str,
+    contact: str,
+    companions: int,
+    companion_names: Optional[list[str]] = None,
+) -> dict:
+    """访客凭 manage_token 发起变更请求（待管理员审核）。"""
+    now = iso(utcnow())
+    names = _normalize_companion_names(companion_names, companions)
+    if isinstance(names, dict):
+        return names
+    new_party_size = companions + 1
+
+    prior = get_change_by_request_id(conn, request_id)
+    if prior is not None:
+        return _change_replay(conn, prior, name, contact, companions, names)
+
+    with write_tx(conn):
+        prior = get_change_by_request_id(conn, request_id)
+        if prior is not None:
+            return _change_replay(conn, prior, name, contact, companions, names)
+
+        app = conn.execute(
+            "SELECT * FROM applications WHERE manage_token=?", (manage_token,)
+        ).fetchone()
+        if app is None:
+            return {"http_status": 404, "error": "申请不存在或链接无效"}
+        if app["status"] in ("CANCELLED", "REJECTED", "EXPIRED"):
+            return {"http_status": 409,
+                    "error": f"申请已处于终态 {app['status']}，不可变更",
+                    "status": app["status"]}
+        batch = get_batch(conn, app["batch_id"])
+        if now >= batch["end_at"]:
+            return {"http_status": 410, "error": "批次访问时段已结束，不能申请变更"}
+        # 已核销 = 访客已到场：任何变更路径都拒绝（提交时就拦下，
+        # 审核时还会在写事务内复查一次以防审核与核销竞态）
+        ticket = _application_ticket_state(conn, app)
+        if ticket is not None and ticket["status"] == "REDEEMED":
+            return {"http_status": 409,
+                    "error": "通行票已核销（访客已到场），不可再变更",
+                    "status": "APPROVED", "ticket_status": "REDEEMED"}
+        # 没有任何实际差异 -> 幂等视为无操作，但不生成变更单（即使已有
+        # 待审变更，无差异请求也不应报冲突）
+        try:
+            cur_names = json.loads(app["companion_names"] or "[]")
+        except json.JSONDecodeError:
+            cur_names = []
+        if (app["name"] == name and app["contact"] == contact
+                and app["companions"] == companions and cur_names == names):
+            return {"http_status": 200, "noop": True,
+                    "application_id": app["id"]}
+
+        existing = get_pending_change(conn, app["id"])
+        if existing is not None:
+            return {"http_status": 409,
+                    "error": "该申请已有一个待审核的变更，请等待审核结果或先撤回",
+                    "change_id": existing["id"]}
+
+        change_seq = int(conn.execute(
+            "SELECT COALESCE(MAX(change_seq),0)+1 s FROM application_changes "
+            "WHERE application_id=?", (app["id"],)
+        ).fetchone()["s"])
+        change_id = _gen_change_id(conn)
+        conn.execute(
+            """INSERT INTO application_changes
+                   (id,application_id,batch_id,change_seq,request_id,status,
+                    old_name,new_name,old_contact,new_contact,old_party_size,
+                    new_party_size,new_companions,new_companion_names,created_at)
+               VALUES (?,?,?,?,?,'PENDING',?,?,?,?,?,?,?,?,?)""",
+            (change_id, app["id"], app["batch_id"], change_seq, request_id,
+             app["name"], name, app["contact"], contact, app["party_size"],
+             new_party_size, companions, json.dumps(names, ensure_ascii=False), now),
+        )
+        add_event(
+            conn,
+            "APPLICATION_CHANGE_SUBMITTED",
+            ts=now,
+            batch_id=app["batch_id"],
+            application_id=app["id"],
+            person_id=app["id"],
+            reason="visitor_change_request",
+            payload={
+                "change_id": change_id,
+                "change_seq": change_seq,
+                "old": {"name": app["name"], "contact": app["contact"],
+                        "party_size": app["party_size"],
+                        "companion_names": cur_names},
+                "new": {"name": name, "contact": contact,
+                        "party_size": new_party_size, "companion_names": names},
+            },
+        )
+        row = get_change(conn, change_id)
+        result = change_dict(row)
+        result["http_status"] = 201
+        result["application_id"] = app["id"]
+    return result
+
+
+def _change_replay(
+    conn: sqlite3.Connection,
+    prior: sqlite3.Row,
+    name: str,
+    contact: str,
+    companions: int,
+    companion_names: list[str],
+) -> dict:
+    """变更请求的幂等重放 / 同键不同载荷冲突。"""
+    if (prior["new_name"] != name or prior["new_contact"] != contact
+            or prior["new_companions"] != companions
+            or json.loads(prior["new_companion_names"] or "[]") != companion_names):
+        return {"http_status": 409,
+                "error": "request_id 已用于内容不同的变更（幂等键冲突）",
+                "change_id": prior["id"]}
+    d = change_dict(prior)
+    d["http_status"] = 200
+    d["replayed"] = True
+    return d
+
+
+def approve_application_change(
+    conn: sqlite3.Connection, *, change_id: str, reason: Optional[str] = None
+) -> dict:
+    """管理员审核通过一条变更请求。
+
+    通过在单个 IMMEDIATE 事务内完成，保证并发变更不突破容量、
+    旧票撤销与新票签发原子可见。
+    """
+    now = iso(utcnow())
+    with write_tx(conn):
+        ch = get_change(conn, change_id)
+        if ch is None:
+            return {"http_status": 404, "error": "变更请求不存在"}
+        if ch["status"] == "APPROVED":
+            return _change_already_decided(conn, ch, duplicated=True)
+        if ch["status"] != "PENDING":
+            return {"http_status": 409,
+                    "error": f"变更请求已处于终态 {ch['status']}，不可再审核",
+                    "status": ch["status"]}
+        app = get_application(conn, ch["application_id"])
+        if app is None:
+            return {"http_status": 404, "error": "对应申请不存在"}
+        if app["status"] in ("CANCELLED", "REJECTED", "EXPIRED"):
+            return {"http_status": 409,
+                    "error": f"申请已处于终态 {app['status']}，变更不能通过",
+                    "status": app["status"]}
+        batch = get_batch(conn, app["batch_id"])
+
+        old_ticket_code = None
+        new_ticket_code = None
+        new_ticket_version = None
+        promoted: list[str] = []
+
+        if app["status"] == "APPROVED":
+            if batch["closed_at"] is not None or now >= batch["end_at"]:
+                return {"http_status": 410,
+                        "error": "批次已关闭或已结束，不能通过已通过申请的变更（换票）"}
+            # 容量：以新总人数替换旧占用重新计算；并发变更在此串行排队
+            used = _used_seats(conn, batch["id"])
+            if used - app["party_size"] + ch["new_party_size"] > batch["capacity"]:
+                return {"http_status": 409,
+                        "error": "变更后总人数将超过批次容量，不能通过",
+                        "used": used, "capacity": batch["capacity"],
+                        "old_party_size": app["party_size"],
+                        "new_party_size": ch["new_party_size"]}
+            old_ticket = _application_ticket_state(conn, app)
+            # 审核与门点核销竞态：旧票已被核销（访客到场）则禁止变更
+            if old_ticket is not None and old_ticket["status"] == "REDEEMED":
+                return {"http_status": 409,
+                        "error": "旧票已核销（访客已到场），变更不能通过",
+                        "ticket_status": "REDEEMED"}
+            if old_ticket is not None and old_ticket["status"] != "ACTIVE":
+                return {"http_status": 409,
+                        "error": f"旧票当前状态为 {old_ticket['status']}，不能换发",
+                        "ticket_status": old_ticket["status"]}
+
+            replacement_reason = (
+                f"申请变更通过: {reason or 'visitor change'} "
+                f"({app['party_size']}人→{ch['new_party_size']}人)"
+            )
+            # 先撤销旧票（终态不可逆），再签发新票；与申请更新同一事务提交
+            if old_ticket is not None:
+                # 预生成新票号以便旧票记录“被哪张票替换”
+                new_ticket_code = _gen_unique_code(conn)
+                _, state = _revoke_ticket_locked(
+                    conn,
+                    code=old_ticket["code"],
+                    reason=replacement_reason,
+                    now=now,
+                    replaced_by_code=new_ticket_code,
+                )
+                if state != "ok":  # 并发核销竞态兜底
+                    return {"http_status": 409,
+                            "error": f"旧票当前状态为 {state}，不能换发",
+                            "ticket_status": state}
+                old_ticket_code = old_ticket["code"]
+                note = (f"访客批次 {batch['id']} · {ch['new_name']}"
+                        f"（共{ch['new_party_size']}人）"
+                        f"· 变更 v{app['change_version'] + 1} 换发")
+                new_ticket_version = _issue_ticket_with_code_locked(
+                    conn,
+                    code=new_ticket_code,
+                    person_id=app["id"],
+                    valid_from=old_ticket["valid_from"],
+                    valid_until=old_ticket["valid_until"],
+                    note=note,
+                    zones=[batch["zone_id"]],
+                    batch_id=batch["id"],
+                    application_id=app["id"],
+                    party_size=ch["new_party_size"],
+                    replaced_code=old_ticket["code"],
+                    replacement_reason=replacement_reason,
+                    now=now,
+                )
+        else:
+            # PENDING / WAITLISTED：不发票；资料按新总人数改写后，重新跑一遍
+            # FIFO 晋级——容量计算实时读取新 party_size（新人数重排候补），
+            # 缩小释放名额时后面的候补可按序晋级，候补自身变更后若放得下也晋级。
+            if app["status"] == "PENDING":
+                # 待审核申请占着名额：放大不能把批次撑爆（并发变更在此串行）
+                used = _used_seats(conn, batch["id"])
+                if used - app["party_size"] + ch["new_party_size"] > batch["capacity"]:
+                    return {"http_status": 409,
+                            "error": "变更后总人数将超过批次容量，不能通过",
+                            "used": used, "capacity": batch["capacity"],
+                            "old_party_size": app["party_size"],
+                            "new_party_size": ch["new_party_size"]}
+
+        # 先改写申请资料（APPROVED 的换票票号也在此原子切换），
+        # 候补重排/晋级随后读取到的就是新人数与新名单。
+        names = json.loads(ch["new_companion_names"] or "[]")
+        if new_ticket_code is not None:
+            conn.execute(
+                """UPDATE applications
+                      SET name=?, contact=?, party_size=?, companions=?,
+                          companion_names=?, change_version=change_version+1,
+                          ticket_code=?
+                    WHERE id=?""",
+                (ch["new_name"], ch["new_contact"], ch["new_party_size"],
+                 ch["new_companions"], ch["new_companion_names"],
+                 new_ticket_code, app["id"]),
+            )
+        else:
+            conn.execute(
+                """UPDATE applications
+                      SET name=?, contact=?, party_size=?, companions=?,
+                          companion_names=?, change_version=change_version+1
+                    WHERE id=?""",
+                (ch["new_name"], ch["new_contact"], ch["new_party_size"],
+                 ch["new_companions"], ch["new_companion_names"], app["id"]),
+            )
+
+        if app["status"] != "APPROVED" and now < batch["end_at"]:
+            promoted = _promote_waitlist(conn, batch_id=batch["id"], now=now)
+
+        conn.execute(
+            """UPDATE application_changes
+                  SET status='APPROVED', decided_at=?, decide_reason=?,
+                      old_ticket_code=?, new_ticket_code=?
+                WHERE id=?""",
+            (now, reason or "admin_approve_change", old_ticket_code,
+             new_ticket_code, ch["id"]),
+        )
+        add_event(
+            conn,
+            "APPLICATION_CHANGE_APPROVED",
+            ts=now,
+            batch_id=app["batch_id"],
+            application_id=app["id"],
+            person_id=app["id"],
+            ticket_code=new_ticket_code,
+            reason=reason or "admin_approve_change",
+            payload={
+                "change_id": ch["id"],
+                "change_seq": ch["change_seq"],
+                "change_version": app["change_version"] + 1,
+                "old": {"name": ch["old_name"], "contact": ch["old_contact"],
+                        "party_size": ch["old_party_size"]},
+                "new": {"name": ch["new_name"], "contact": ch["new_contact"],
+                        "party_size": ch["new_party_size"],
+                        "companion_names": names},
+                "old_ticket_code": old_ticket_code,
+                "new_ticket_code": new_ticket_code,
+                "new_ticket_version": new_ticket_version,
+                "promoted": promoted,
+            },
+        )
+        row = get_change(conn, change_id)
+        app_row = get_application(conn, app["id"])
+        new_ticket_row = (
+            conn.execute("SELECT * FROM tickets WHERE code=?",
+                         (new_ticket_code,)).fetchone()
+            if new_ticket_code else None
+        )
+    out = {
+        "http_status": 200,
+        "change": change_dict(row),
+        "application": app_dict(app_row),
+        "old_ticket_code": old_ticket_code,
+        "new_ticket": ticket_dict(new_ticket_row) if new_ticket_row else None,
+        "promoted": promoted,
+    }
+    return out
+
+
+def _issue_ticket_with_code_locked(
+    conn: sqlite3.Connection, *, code: str, now: str, **kwargs
+) -> int:
+    """同 _issue_ticket_locked 但使用指定票号（原子换票时旧票先记了新票号）。"""
+    zone_list = list(kwargs.get("zones") or [])
+    conn.execute(
+        """INSERT INTO tickets
+               (code,person_id,valid_from,valid_until,issued_at,status,note,zones,
+                batch_id,application_id,party_size,replaced_code,replacement_reason)
+           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?)""",
+        (code, kwargs["person_id"], kwargs["valid_from"], kwargs["valid_until"], now,
+         kwargs.get("note"), json.dumps(zone_list, ensure_ascii=False),
+         kwargs.get("batch_id"), kwargs.get("application_id"),
+         kwargs.get("party_size"), kwargs.get("replaced_code"),
+         kwargs.get("replacement_reason")),
+    )
+    payload = {
+        "valid_from": kwargs["valid_from"],
+        "valid_until": kwargs["valid_until"],
+        "note": kwargs.get("note"),
+        "zones": zone_list,
+        "replaced_code": kwargs.get("replaced_code"),
+        "replacement_reason": kwargs.get("replacement_reason"),
+        "party_size": kwargs.get("party_size"),
+        "batch_id": kwargs.get("batch_id"),
+        "application_id": kwargs.get("application_id"),
+    }
+    return add_event(
+        conn,
+        "TICKET_ISSUED",
+        ts=now,
+        ticket_code=code,
+        person_id=kwargs["person_id"],
+        payload=payload,
+        batch_id=kwargs.get("batch_id"),
+        application_id=kwargs.get("application_id"),
+    )
+
+
+def _change_already_decided(
+    conn: sqlite3.Connection, ch: sqlite3.Row, *, duplicated: bool
+) -> dict:
+    d = {"http_status": 200, "duplicated": duplicated, "change": change_dict(ch)}
+    if ch["new_ticket_code"]:
+        t = conn.execute(
+            "SELECT * FROM tickets WHERE code=?", (ch["new_ticket_code"],)
+        ).fetchone()
+        d["new_ticket"] = ticket_dict(t) if t else None
+    return d
+
+
+def reject_application_change(
+    conn: sqlite3.Connection, *, change_id: str, reason: str
+) -> dict:
+    """管理员拒绝变更：申请资料与旧票均不变，不产生任何票。"""
+    now = iso(utcnow())
+    with write_tx(conn):
+        ch = get_change(conn, change_id)
+        if ch is None:
+            return {"http_status": 404, "error": "变更请求不存在"}
+        if ch["status"] != "PENDING":
+            return {"http_status": 409,
+                    "error": f"变更请求已处于终态 {ch['status']}，不可再操作",
+                    "status": ch["status"]}
+        conn.execute(
+            """UPDATE application_changes
+                  SET status='REJECTED', decided_at=?, decide_reason=?
+                WHERE id=?""",
+            (now, reason or "admin_reject_change", ch["id"]),
+        )
+        add_event(
+            conn,
+            "APPLICATION_CHANGE_REJECTED",
+            ts=now,
+            batch_id=ch["batch_id"],
+            application_id=ch["application_id"],
+            person_id=ch["application_id"],
+            reason=reason or "admin_reject_change",
+            payload={"change_id": ch["id"], "change_seq": ch["change_seq"]},
+        )
+        row = get_change(conn, change_id)
+    return {"http_status": 200, "change": change_dict(row)}
+
+
+def cancel_application_change(
+    conn: sqlite3.Connection, *, manage_token: str, change_id: str
+) -> dict:
+    """访客自行撤回自己的待审核变更（公开端点，凭 manage_token）。"""
+    now = iso(utcnow())
+    with write_tx(conn):
+        app = conn.execute(
+            "SELECT * FROM applications WHERE manage_token=?", (manage_token,)
+        ).fetchone()
+        if app is None:
+            return {"http_status": 404, "error": "申请不存在或链接无效"}
+        ch = get_change(conn, change_id)
+        if ch is None or ch["application_id"] != app["id"]:
+            return {"http_status": 404, "error": "变更请求不存在"}
+        if ch["status"] != "PENDING":
+            return {"http_status": 409,
+                    "error": f"变更请求已处于终态 {ch['status']}，不可撤回",
+                    "status": ch["status"]}
+        conn.execute(
+            """UPDATE application_changes
+                  SET status='CANCELLED', decided_at=?, decide_reason='visitor_cancel'
+                WHERE id=?""",
+            (now, ch["id"]),
+        )
+        add_event(
+            conn,
+            "APPLICATION_CHANGE_CANCELLED",
+            ts=now,
+            batch_id=ch["batch_id"],
+            application_id=ch["application_id"],
+            person_id=ch["application_id"],
+            reason="visitor_cancel",
+            payload={"change_id": ch["id"], "change_seq": ch["change_seq"]},
+        )
+        row = get_change(conn, change_id)
+    return {"http_status": 200, "change": change_dict(row)}
+
+
+def list_changes(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: Optional[str] = None,
+    application_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[dict]:
+    sql = "SELECT * FROM application_changes WHERE 1=1"
+    params: list = []
+    if batch_id:
+        sql += " AND batch_id=?"
+        params.append(batch_id)
+    if application_id:
+        sql += " AND application_id=?"
+        params.append(application_id)
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    sql += " ORDER BY id DESC"
+    return [change_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def list_applications(
@@ -1635,6 +2293,8 @@ def batch_detail(conn: sqlite3.Connection, batch_id: str) -> Optional[dict]:
         "applications": applications,
         "waitlist": [a for a in applications if a["status"] == "WAITLISTED"],
         "tickets": tickets,
+        "changes": list_changes(conn, batch_id=batch_id),
+        "pending_changes": list_changes(conn, batch_id=batch_id, status="PENDING"),
         "capacity_log": capacity_log(conn, batch_id),
         "events": events,
         "now": now,
@@ -1674,6 +2334,9 @@ def sweep_applications(conn: sqlite3.Connection) -> list[str]:
                 payload={"name": a["name"], "party_size": a["party_size"],
                          "from_status": a["status"]},
             )
+            # 该申请若有待审核变更，随批次结束过期（不产生票、不改申请资料）
+            _finalize_pending_changes(
+                conn, a, "EXPIRED", reason="batch_ended", now=now)
             expired.append(a["id"])
     return expired
 
@@ -1930,6 +2593,12 @@ def stats(conn: sqlite3.Connection) -> dict:
         for s in ("PENDING", "WAITLISTED", "APPROVED",
                   "CANCELLED", "REJECTED", "EXPIRED")
     }
+    changes_counts = {
+        s: conn.execute(
+            "SELECT COUNT(*) c FROM application_changes WHERE status=?", (s,)
+        ).fetchone()["c"]
+        for s in ("PENDING", "APPROVED", "REJECTED", "CANCELLED", "EXPIRED")
+    }
     return {
         "now": now_str,
         "tickets": counts,
@@ -1947,4 +2616,5 @@ def stats(conn: sqlite3.Connection) -> dict:
         "batches": batches_total,
         "batches_open": batches_open,
         "applications": apps_counts,
+        "changes": changes_counts,
     }

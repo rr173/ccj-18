@@ -20,8 +20,9 @@
     <input id="f-contact" maxlength="128" placeholder="用于审核联络" required>
     <label>同行人数（不含本人，0 = 独自到访）</label>
     <input id="f-companions" type="number" min="0" max="1000" value="0" required>
+    <div id="f-names-wrap"></div>
     <p class="hint">名额按“本人 + 同行人数”整组占用；满额时将自动进入按提交时间排序的候补队列。
-      请不要重复提交，本页对网络重试自动幂等。</p>
+      请填写每位同行人姓名供门点核对。请不要重复提交，本页对网络重试自动幂等。</p>
     <button class="btn primary big" type="submit" style="width:100%;margin-top:8px">提交申请</button>
   </form>
 

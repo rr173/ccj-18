@@ -54,7 +54,7 @@ function renderHistory() {
   const h = getHist();
   $("history").innerHTML = h.map(x => `<tr>
     <td>${fmtTime(x.ts)}</td>
-    <td class="mono">${esc(x.code)}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人</div>` : ""}</td>
+    <td class="mono">${esc(x.code)}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人 · v${x.change_version ?? 0}</div>` : ""}</td>
     <td><span class="badge ${x.ok ? "ok" : "fail"}">${x.ok ? "放行" : "拒绝"}</span></td>
     <td>${esc(x.detail || x.status || "")}${x.replayed ? " <span class='muted'>(幂等重放)</span>" : ""}</td>
   </tr>`).join("") || '<tr><td colspan=4 class="muted">暂无</td></tr>';
@@ -72,9 +72,16 @@ function showResult(r, httpStatus, replayed) {
       ${a ? `<br>🏷️ 批次 <b>${esc(a.batch_id)}</b>${a.batch_name ? "（" + esc(a.batch_name) + "）" : ""}
              ${a.visit_date ? " · " + esc(a.visit_date) : ""}
              · 访客 <b>${esc(a.applicant_name || "")}</b>
-             · <b>同行共 ${a.party_size} 人</b>` : ""}
+             · <b>同行共 ${a.party_size} 人</b>
+             · 资料版本 <b>v${a.change_version ?? 0}</b>
+             ${(a.companion_names || []).filter(Boolean).length
+               ? "<br>同行人名单：" + a.companion_names.filter(Boolean).map(esc).join("、")
+               : ""}
+             ${a.replaced_code ? `<br>♻ 本票为变更后换发（替换旧票 <span class="mono">${esc(a.replaced_code)}</span>）：${esc(a.replacement_reason || "")}` : ""}
+             ${a.replaced_by_code ? `<br>♻ 本票已因申请变更被替换，请改扫新票 <span class="mono">${esc(a.replaced_by_code)}</span>` : ""}` : ""}
       ${r.redeemed_gate ? "<br>已由门点 <b>" + esc(r.redeemed_gate) + "</b> 于 " + fmtTime(r.redeemed_at) + " 核销" : ""}
       ${r.revoked_reason ? "<br>作废原因：" + esc(r.revoked_reason) : ""}
+      ${r.replaced_by_code && !a ? "<br>请改扫新票 <span class='mono'>" + esc(r.replaced_by_code) + "</span>" : ""}
       ${r.reason === "zone_mismatch" ? "<br>本门点分区 <b>" + esc(r.zone_id || "") + "</b>，票据允许分区：" + esc((r.ticket_zones || []).join("、") || "（无）") : ""}
       ${r.lock_rule ? "<br>封锁规则 <b>" + esc(r.lock_rule.rule_id) + "</b>（版本 #" + r.lock_rule.version + "）：" + esc(r.lock_rule.reason || "") : ""}
       ${r.reason === "stale_policy" ? "<br>本门点策略版本 #" + r.policy_version + "，服务器已到 #" + r.current_policy_version + "，正在自动补齐…" : ""}
@@ -145,6 +152,7 @@ async function flushQueue() {
         replayed: !!r.replayed,
         party_size: r.appointment ? r.appointment.party_size : null,
         applicant: r.appointment ? r.appointment.applicant_name : null,
+        change_version: r.appointment ? r.appointment.change_version : null,
       });
       setHist(h);
       if (!r.replayed) showResult(r, r.ok ? 200 : (r.reason === "already_redeemed" ? 409 : 410), false);

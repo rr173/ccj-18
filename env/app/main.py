@@ -155,6 +155,7 @@ class BackfillIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     contact: str = Field(min_length=1, max_length=128)
     companions: int = Field(default=0, ge=0, le=1000)  # 同行人数（不含申请人）
+    companion_names: Optional[list[str]] = None
     reason: Optional[str] = Field(default=None, max_length=300)
     approve: bool = True  # false = 仅补录为待审核（占座，仍受容量约束）
 
@@ -168,6 +169,23 @@ class ApplicationSubmitIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     contact: str = Field(min_length=1, max_length=128)
     companions: int = Field(default=0, ge=0, le=1000)
+    companion_names: Optional[list[str]] = None  # 同行人姓名名单；长度须=companions
+
+
+class ApplicationChangeIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128)  # 变更请求幂等键
+    name: str = Field(min_length=1, max_length=128)
+    contact: str = Field(min_length=1, max_length=128)
+    companions: int = Field(default=0, ge=0, le=1000)
+    companion_names: Optional[list[str]] = None
+
+
+class ChangeCancelIn(BaseModel):
+    change_id: str = Field(min_length=1, max_length=64)
+
+
+class ChangeTokenIn(BaseModel):
+    manage_token: str = Field(min_length=8, max_length=128)
 
 
 # ---------------- 健康检查 / 页面 ----------------
@@ -487,9 +505,12 @@ def admin_backfill(
         name=body.name.strip(),
         contact=body.contact.strip(),
         companions=body.companions,
+        companion_names=body.companion_names,
         reason=body.reason,
         approve=body.approve,
     )
+    if result["http_status"] == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
     if result["http_status"] == 404:
         raise HTTPException(status_code=404, detail=result["error"])
     if result["http_status"] == 409:
@@ -552,6 +573,56 @@ def admin_cancel_application(
     return result
 
 
+# ---------------- 申请变更审核（管理端） ----------------
+
+@app.get("/api/admin/changes", dependencies=[Depends(require_admin)])
+def admin_list_changes(
+    batch_id: Optional[str] = Query(default=None),
+    application_id: Optional[str] = Query(default=None),
+    status_filter: str = Query(default="", alias="status"),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"changes": services.list_changes(
+        conn, batch_id=batch_id, application_id=application_id,
+        status=status_filter.upper() or None)}
+
+
+@app.post("/api/admin/changes/{change_id}/approve",
+          dependencies=[Depends(require_admin)])
+def admin_approve_change(
+    change_id: str, body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.approve_application_change(
+        conn, change_id=change_id, reason=body.reason
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    if result["http_status"] == 410:
+        raise HTTPException(status_code=410, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.post("/api/admin/changes/{change_id}/reject",
+          dependencies=[Depends(require_admin)])
+def admin_reject_change(
+    change_id: str, body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.reject_application_change(
+        conn, change_id=change_id, reason=body.reason
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
 # ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
 
 @app.get("/api/public/batches/{token}")
@@ -573,8 +644,11 @@ def public_submit(
         name=body.name.strip(),
         contact=body.contact.strip(),
         companions=body.companions,
+        companion_names=body.companion_names,
     )
     status = result.pop("http_status", 200)
+    if status == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
     if status == 404:
         raise HTTPException(status_code=404, detail=result["error"])
     if status == 409:
@@ -591,6 +665,54 @@ def public_application(manage_token: str, conn: sqlite3.Connection = Depends(get
     if view is None:
         raise HTTPException(status_code=404, detail="申请不存在或链接无效")
     return view
+
+
+@app.post("/api/public/applications/{manage_token}/changes")
+def public_submit_change(
+    manage_token: str,
+    body: ApplicationChangeIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """访客凭申请的 manage_token 发起变更（公开，无 Bearer）。"""
+    result = services.submit_application_change(
+        conn,
+        manage_token=manage_token,
+        request_id=body.request_id.strip(),
+        name=body.name.strip(),
+        contact=body.contact.strip(),
+        companions=body.companions,
+        companion_names=body.companion_names,
+    )
+    status = result.pop("http_status", 200)
+    if status == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    if status == 410:
+        raise HTTPException(status_code=410, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.post("/api/public/changes/{change_id}/cancel")
+def public_cancel_change(
+    change_id: str,
+    body: ChangeTokenIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """访客撤回自己的待审核变更（须携带该申请的 manage_token）。"""
+    result = services.cancel_application_change(
+        conn, manage_token=body.manage_token.strip(), change_id=change_id
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
 
 
 # ---------------- 门点 API ----------------

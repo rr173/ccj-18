@@ -52,8 +52,23 @@ EVENT_TYPES = (
     "APPLICATION_CANCELLED",
     "APPLICATION_REJECTED",
     "APPLICATION_EXPIRED",
+    # 访客申请变更（修改姓名/联系方式/同行人数与同行人名单）
+    "APPLICATION_CHANGE_SUBMITTED",
+    "APPLICATION_CHANGE_APPROVED",
+    "APPLICATION_CHANGE_REJECTED",
+    "APPLICATION_CHANGE_CANCELLED",
+    "APPLICATION_CHANGE_EXPIRED",
 )
 RULE_ACTIONS = ("LOCK", "UNLOCK")
+
+# 变更请求状态机：
+#   PENDING（访客已提交，待管理员审核）
+#   -> APPROVED（审核通过：申请资料被改写；已通过申请同事务换票）
+#   / REJECTED（管理员拒绝，申请与旧票均不变）
+#   / CANCELLED（访客自行撤回，或申请本身被取消/拒绝）
+#   / EXPIRED（批次结束仍未审核）
+# 后四个均为终态，不产生任何可用票（APPROVED 除外，且其票为原子换发）。
+CHANGE_STATUSES = ("PENDING", "APPROVED", "REJECTED", "CANCELLED", "EXPIRED")
 
 # 申请状态机：
 #   PENDING（在容量内，待审核）/ WAITLISTED（满额候补，按 seq 排序）
@@ -102,7 +117,10 @@ CREATE TABLE IF NOT EXISTS tickets (
     zones          TEXT NOT NULL DEFAULT '[]',  -- JSON 数组：允许通行的分区
     batch_id       TEXT,            -- 预约批次签发的票：所属批次
     application_id TEXT,            -- 预约批次签发的票：对应申请
-    party_size     INTEGER          -- 预约批次签发的票：同行总人数（含申请人）
+    party_size     INTEGER,         -- 预约批次签发的票：同行总人数（含申请人）
+    replaced_code  TEXT,            -- 变更换发的新票：原子替换掉的旧票号
+    replaced_by_code TEXT,          -- 变更撤销的旧票：原子换发出来的新票号
+    replacement_reason TEXT         -- 作为旧票被撤销时的撤销原因（变更说明）
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_person ON tickets(person_id);
 
@@ -116,7 +134,10 @@ CREATE TABLE IF NOT EXISTS events (
                        'POLICY_LOCK','POLICY_UNLOCK',
                        'BATCH_CREATED','BATCH_CLOSED','BATCH_CAPACITY_CHANGED',
                        'APPLICATION_SUBMITTED','APPLICATION_PROMOTED','APPLICATION_APPROVED',
-                       'APPLICATION_CANCELLED','APPLICATION_REJECTED','APPLICATION_EXPIRED')),
+                       'APPLICATION_CANCELLED','APPLICATION_REJECTED','APPLICATION_EXPIRED',
+                       'APPLICATION_CHANGE_SUBMITTED','APPLICATION_CHANGE_APPROVED',
+                       'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
+                       'APPLICATION_CHANGE_EXPIRED')),
     ticket_code    TEXT,
     person_id      TEXT,
     gate_id        TEXT,
@@ -196,7 +217,9 @@ CREATE TABLE IF NOT EXISTS applications (
     promoted_at   TEXT,                      -- 候补晋级（WAITLISTED->PENDING）时间
     decided_at    TEXT,                      -- 审核/取消/拒绝/过期终态时间
     decide_reason TEXT,
-    ticket_code   TEXT UNIQUE                -- 审核通过后自动签发的票
+    ticket_code   TEXT UNIQUE,               -- 审核通过后自动签发的票
+    change_version INTEGER NOT NULL DEFAULT 0,  -- 已审核通过的变更次数（当前申请资料版本）
+    companion_names TEXT NOT NULL DEFAULT '[]'  -- JSON 数组：同行人姓名名单（长度=companions）
 );
 CREATE INDEX IF NOT EXISTS idx_apps_batch ON applications(batch_id);
 CREATE INDEX IF NOT EXISTS idx_apps_status ON applications(batch_id, status);
@@ -212,6 +235,34 @@ CREATE TABLE IF NOT EXISTS batch_capacity_log (
     changed_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_caplog_batch ON batch_capacity_log(batch_id);
+
+-- 访客申请变更请求：访客凭申请的 manage_token 发起，管理员审核
+CREATE TABLE IF NOT EXISTS application_changes (
+    id            TEXT PRIMARY KEY,          -- C-XXXXXXXX
+    application_id TEXT NOT NULL,
+    batch_id      TEXT NOT NULL,
+    change_seq    INTEGER NOT NULL,          -- 该申请内变更序号（事务内分配）
+    request_id    TEXT NOT NULL UNIQUE,      -- 变更请求幂等键（浏览器生成的 UUID）
+    status        TEXT NOT NULL
+                  CHECK (status IN ('PENDING','APPROVED','REJECTED',
+                                    'CANCELLED','EXPIRED')),
+    old_name      TEXT NOT NULL,
+    new_name      TEXT NOT NULL,
+    old_contact   TEXT NOT NULL,
+    new_contact   TEXT NOT NULL,
+    old_party_size INTEGER NOT NULL,
+    new_party_size INTEGER NOT NULL,
+    new_companions INTEGER NOT NULL,
+    new_companion_names TEXT NOT NULL DEFAULT '[]',  -- JSON 数组：变更后的同行人名单
+    decided_at    TEXT,
+    decide_reason TEXT,
+    old_ticket_code TEXT,                     -- 通过时被原子撤销的旧票
+    new_ticket_code TEXT,                     -- 通过时原子签发的新票
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_changes_app ON application_changes(application_id);
+CREATE INDEX IF NOT EXISTS idx_changes_batch ON application_changes(batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_changes_status ON application_changes(status);
 """
 
 
@@ -275,6 +326,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tickets ADD COLUMN application_id TEXT")
     if "party_size" not in ticket_cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN party_size INTEGER")
+    if "replaced_code" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN replaced_code TEXT")
+    if "replaced_by_code" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN replaced_by_code TEXT")
+    if "replacement_reason" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN replacement_reason TEXT")
+
+    app_cols = {r["name"] for r in conn.execute("PRAGMA table_info(applications)")}
+    if "change_version" not in app_cols:
+        conn.execute(
+            "ALTER TABLE applications ADD COLUMN change_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "companion_names" not in app_cols:
+        conn.execute(
+            "ALTER TABLE applications ADD COLUMN companion_names TEXT NOT NULL DEFAULT '[]'"
+        )
 
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
@@ -282,6 +349,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # 每引入新事件类型/新列都需要重建一次（历史与版本号完整保留、继续递增）
     if row and (
         "APPLICATION_SUBMITTED" not in row["sql"]
+        or "APPLICATION_CHANGE_SUBMITTED" not in row["sql"]
         or "batch_id" not in row["sql"]
     ):
         conn.execute("BEGIN IMMEDIATE")
@@ -298,7 +366,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                                           'BATCH_CREATED','BATCH_CLOSED','BATCH_CAPACITY_CHANGED',
                                           'APPLICATION_SUBMITTED','APPLICATION_PROMOTED',
                                           'APPLICATION_APPROVED','APPLICATION_CANCELLED',
-                                          'APPLICATION_REJECTED','APPLICATION_EXPIRED')),
+                                          'APPLICATION_REJECTED','APPLICATION_EXPIRED',
+                                          'APPLICATION_CHANGE_SUBMITTED','APPLICATION_CHANGE_APPROVED',
+                                          'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
+                                          'APPLICATION_CHANGE_EXPIRED')),
                        ticket_code    TEXT,
                        person_id      TEXT,
                        gate_id        TEXT,

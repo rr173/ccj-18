@@ -186,14 +186,21 @@ def test_publish_idempotent_and_conflict(srv):
 # 7. 门点离线重连按版本补齐策略事件
 def test_policy_events_caught_up_by_sync(srv):
     c = gate_client(srv)
-    batch = c.post("/api/gate/sync",
-                   json={"gate_id": "gz-b", "since_version": 0}).json()
-    versions = [e["version"] for e in batch["events"]]
+    # 与门点真实行为一致按 has_more 翻页（每页 200 条，事件总量可能跨页）
+    events, since = [], 0
+    for _ in range(50):
+        batch = c.post("/api/gate/sync",
+                       json={"gate_id": "gz-b", "since_version": since}).json()
+        events.extend(batch["events"])
+        since = batch["next_since"]
+        if not batch["has_more"]:
+            break
+    versions = [e["version"] for e in events]
     assert versions == sorted(versions)
-    types = {e["type"] for e in batch["events"]}
+    types = {e["type"] for e in events}
     assert "POLICY_LOCK" in types and "POLICY_UNLOCK" in types
     # 策略事件带有规则内容，门点可据此更新本地策略版本
-    lock_events = [e for e in batch["events"] if e["type"] == "POLICY_LOCK"]
+    lock_events = [e for e in events if e["type"] == "POLICY_LOCK"]
     assert all("rule_id" in e["payload"] for e in lock_events)
 
 

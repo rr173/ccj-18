@@ -357,9 +357,13 @@ async function loadBatchView() {
       <td>${l.old_capacity === null ? "（建批）" : l.old_capacity} → <b>${l.new_capacity}</b></td>
       <td>${esc(l.reason || "")}</td>
     </tr>`).join("");
-    const appRows = v.applications.map(a => `<tr>
+    const appRows = v.applications.map(a => {
+      const names = (a.companion_names || []).filter(Boolean);
+      return `<tr>
       <td>${a.seq}${a.status === "WAITLISTED" ? `<div class="muted">#候补${a.waitlist_position}</div>` : ""}</td>
-      <td>${esc(a.name)}<div class="muted" style="font-size:11px">${esc(a.contact)}</div></td>
+      <td>${esc(a.name)}<div class="muted" style="font-size:11px">${esc(a.contact)}</div>
+          ${names.length ? `<div class="muted" style="font-size:11px">同行：${names.map(esc).join("、")}</div>` : ""}
+          ${a.change_version ? `<div class="muted" style="font-size:11px">资料版本 v${a.change_version}</div>` : ""}</td>
       <td>${a.party_size}${a.source === "admin" ? ' <span class="badge UNKNOWN">补录</span>' : ""}</td>
       <td><span class="badge ${APP_BADGE[a.status] || "UNKNOWN"}">${APP_TEXT[a.status] || a.status}</span>
           ${a.promoted_at ? `<div class="muted" style="font-size:11px">${fmtTime(a.promoted_at)} 晋级</div>` : ""}</td>
@@ -368,13 +372,16 @@ async function loadBatchView() {
         : "—"}</td>
       <td>${esc(a.decide_reason || "")}</td>
       <td>${actionButtons(a, b)}</td>
-    </tr>`).join("");
+    </tr>`; }).join("");
     const ticketRows = v.tickets.map(t => `<tr>
-      <td class="mono code-cell">${esc(t.code)}</td>
+      <td class="mono code-cell">${esc(t.code)}
+          ${t.replaced_code ? `<div class="muted" style="font-size:11px">换自 ${esc(t.replaced_code)}</div>` : ""}
+          ${t.replaced_by_code ? `<div class="muted" style="font-size:11px">→新票 ${esc(t.replaced_by_code)}</div>` : ""}</td>
       <td>${badge(t.status)}</td>
       <td>${t.party_size ?? ""}</td>
       <td>${fmtTime(t.valid_from)}<br><span class="muted">至 ${fmtTime(t.valid_until)}</span></td>
       <td>${t.redeemed_gate ? esc(t.redeemed_gate) + " @ " + fmtTime(t.redeemed_at) : "—"}</td>
+      <td>${t.revoked_reason ? esc(t.revoked_reason) : "—"}</td>
     </tr>`).join("");
     const eventRows = v.events.map(e => `<tr>
       <td class="mono">#${e.version}</td><td>${fmtTime(e.ts)}</td>
@@ -383,6 +390,30 @@ async function loadBatchView() {
       <td class="mono">${esc(e.ticket_code || "")}</td>
       <td>${esc(e.reason || "")}</td>
     </tr>`).join("");
+
+    const changeRows = (v.changes || []).map(ch => {
+      const C_BADGE = { PENDING: "offline", APPROVED: "ACTIVE", REJECTED: "REVOKED",
+                        CANCELLED: "REVOKED", EXPIRED: "EXPIRED" };
+      const C_TEXT = { PENDING: "待审核", APPROVED: "已通过", REJECTED: "已拒绝",
+                       CANCELLED: "已撤回", EXPIRED: "已过期" };
+      const newNames = (ch.new_companion_names || []).filter(Boolean);
+      return `<tr>
+        <td class="mono">${esc(ch.id)}<div class="muted" style="font-size:11px">${esc(ch.application_id)}</div></td>
+        <td><span class="badge ${C_BADGE[ch.status]}">${C_TEXT[ch.status]}</span>
+            <div class="muted" style="font-size:11px">${fmtTime(ch.created_at)}</div></td>
+        <td>${esc(ch.old_name)}（${ch.old_party_size}人）<br>→ <b>${esc(ch.new_name)}</b>
+            （${ch.new_party_size}人）
+            ${newNames.length ? `<div class="muted" style="font-size:11px">同行：${newNames.map(esc).join("、")}</div>` : ""}</td>
+        <td class="mono">${ch.old_ticket_code ? esc(ch.old_ticket_code) : "—"}</td>
+        <td class="mono">${ch.new_ticket_code ? esc(ch.new_ticket_code) : "—"}</td>
+        <td>${esc(ch.decide_reason || "")}</td>
+        <td>${ch.status === "PENDING"
+          ? `<button class="btn small primary" onclick="decideChange('${esc(ch.id)}','approve')">通过${ch.old_ticket_code === null && ch.new_ticket_code === null ? "" : ""}</button>
+             <button class="btn small danger" onclick="decideChange('${esc(ch.id)}','reject')">拒绝</button>`
+          : ""}</td>
+      </tr>`;
+    }).join("");
+    const pendingCount = (v.pending_changes || []).length;
 
     $("bv-detail").innerHTML =
       `<h2>${esc(b.id)} ${b.name ? "· " + esc(b.name) : ""} ${batchStateBadge(b)}</h2>
@@ -402,15 +433,20 @@ async function loadBatchView() {
        <div class="row" style="margin-top:10px">
          <input id="bf-name" placeholder="补录姓名">
          <input id="bf-contact" placeholder="补录联系方式">
-         <input id="bf-comp" type="number" min="0" value="0" title="同行人数（不含本人）">
+         <input id="bf-comp" type="number" min="0" value="0" title="同行人数（不含本人）" oninput="syncBfNames()">
          <button class="btn primary" onclick="backfill('${esc(b.id)}')">补录并通过签票</button>
        </div>
+       <div class="row" id="bf-names" style="margin-top:6px"></div>
+       <div class="section"><h2>申请变更审核${pendingCount ? ` <span class="badge offline">${pendingCount} 条待审</span>` : ""}</h2>
+       <table><thead><tr><th>变更</th><th>状态</th><th>内容（旧→新）</th><th>旧票</th><th>新票</th><th>原因</th><th>操作</th></tr></thead>
+       <tbody>${changeRows || '<tr><td colspan=7 class=muted>暂无变更。访客可凭申请后的管理链接修改姓名/联系方式/同行人数及同行名单。</td></tr>'}</tbody></table>
+       <p class="hint">已通过申请的变更审核通过时，在同一事务原子撤销旧票并签发新票；已核销（访客到场）的申请不能变更。候补申请的变更按新总人数重新判定名次与晋级。</p></div>
        <div class="section"><h2>申请（按提交顺序；候补名次即顺序）</h2>
        <table><thead><tr><th>#</th><th>访客</th><th>人数</th><th>状态</th><th>通行票</th><th>原因/备注</th><th>操作</th></tr></thead>
        <tbody>${appRows || '<tr><td colspan=7 class=muted>无申请</td></tr>'}</tbody></table></div>
-       <div class="section"><h2>已签发的票（${v.tickets.length}）</h2>
-       <table><thead><tr><th>票号</th><th>状态</th><th>人数</th><th>有效期</th><th>核销</th></tr></thead>
-       <tbody>${ticketRows || '<tr><td colspan=5 class=muted>无（仅审核通过/补录通过才签票；取消、过期、候补未晋级均无票）</td></tr>'}</tbody></table></div>
+       <div class="section"><h2>已签发的票（${v.tickets.length}，含变更替换掉的旧票）</h2>
+       <table><thead><tr><th>票号</th><th>状态</th><th>人数</th><th>有效期</th><th>核销</th><th>作废/替换原因</th></tr></thead>
+       <tbody>${ticketRows || '<tr><td colspan=6 class=muted>无（仅审核通过/补录通过才签票；取消、过期、候补未晋级均无票）</td></tr>'}</tbody></table></div>
        <div class="section"><h2>容量变化记录</h2>
        <table><thead><tr><th>时间</th><th>容量</th><th>原因</th></tr></thead>
        <tbody>${capRows}</tbody></table></div>
@@ -454,6 +490,23 @@ window.decideApp = async (id, action) => {
   } catch (e) { toast(e.message, "error"); }
 };
 
+window.decideChange = async (id, action) => {
+  const isApprove = action === "approve";
+  if (!confirm(isApprove
+    ? `通过变更 ${id}？已通过的申请将在同一事务撤销旧票并签发新票（容量不足会被拒绝）。`
+    : `拒绝变更 ${id}？申请资料与旧票保持不变。`)) return;
+  try {
+    const r = await adminApi("POST", `/api/admin/changes/${encodeURIComponent(id)}/${action}`,
+      { reason: isApprove ? "admin_approve_change" : "admin_reject_change" });
+    if (isApprove && r.new_ticket) {
+      toast(`变更已通过：旧票 ${r.old_ticket_code} 已撤销，新票 ${r.new_ticket.code} 已签发`, "success");
+    } else {
+      toast(isApprove ? "变更已通过" : "变更已拒绝", "success");
+    }
+    await Promise.all([loadBatchView(), loadBatches(), loadStats()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
 window.changeCap = async (id) => {
   const capacity = parseInt($("bv-cap").value, 10);
   if (!capacity) return toast("容量无效", "error");
@@ -478,12 +531,30 @@ window.backfill = async id => {
   const name = $("bf-name").value.trim(), contact = $("bf-contact").value.trim();
   const companions = parseInt($("bf-comp").value, 10);
   if (!name || !contact) return toast("补录姓名与联系方式必填", "error");
+  const n = isNaN(companions) ? 0 : companions;
+  const companionNames = [];
+  document.querySelectorAll("#bf-names input").forEach((inp, i) => {
+    if (i < n) companionNames.push(inp.value.trim());
+  });
   try {
     const r = await adminApi("POST", `/api/admin/batches/${encodeURIComponent(id)}/backfill`,
-      { name, contact, companions: isNaN(companions) ? 0 : companions });
+      { name, contact, companions: n, companion_names: companionNames });
     toast(`补录成功，已签票：${r.ticket.code}`, "success");
     await Promise.all([loadBatchView(), loadBatches(), loadStats()]);
   } catch (e) { toast(e.message, "error"); }
+};
+
+window.syncBfNames = () => {
+  const n = Math.max(0, parseInt($("bf-comp").value, 10) || 0);
+  const wrap = $("bf-names");
+  const old = [...wrap.querySelectorAll("input")].map(i => i.value);
+  wrap.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const inp = document.createElement("input");
+    inp.placeholder = `同行人 ${i + 1} 姓名`;
+    inp.value = old[i] || "";
+    wrap.appendChild(inp);
+  }
 };
 
 // ---------------- 按人 ----------------
@@ -576,7 +647,10 @@ $("btn-events").onclick = async () => {
     $("e-table").querySelector("tbody").innerHTML = events.map(e => {
       let badgeHtml;
       if (e.type === "POLICY_LOCK" || e.type === "BATCH_CLOSED"
-          || e.type === "APPLICATION_CANCELLED" || e.type === "APPLICATION_REJECTED") {
+          || e.type === "APPLICATION_CANCELLED" || e.type === "APPLICATION_REJECTED"
+          || e.type === "APPLICATION_CHANGE_REJECTED"
+          || e.type === "APPLICATION_CHANGE_CANCELLED"
+          || e.type === "APPLICATION_CHANGE_EXPIRED") {
         badgeHtml = '<span class="badge LOCKED">' + esc(e.type) + "</span>";
       } else if (e.type === "TICKET_REDEEMED") {
         badgeHtml = badge("REDEEMED") + esc(e.type.replace("TICKET_", ""));
@@ -586,6 +660,10 @@ $("btn-events").onclick = async () => {
         badgeHtml = badge("EXPIRED") + esc(e.type);
       } else if (e.type === "POLICY_UNLOCK") {
         badgeHtml = '<span class="badge OPEN">UNLOCK</span>解锁';
+      } else if (e.type === "APPLICATION_CHANGE_SUBMITTED") {
+        badgeHtml = '<span class="badge offline">变更提交</span>';
+      } else if (e.type === "APPLICATION_CHANGE_APPROVED") {
+        badgeHtml = '<span class="badge ACTIVE">变更通过·换票</span>';
       } else {
         badgeHtml = badge("ACTIVE") + esc(e.type.replace("TICKET_", ""));
       }
@@ -634,6 +712,7 @@ async function loadStats() {
       ["预约批次", `${s.batches}（开放 ${s.batches_open}）`, "#7dd3fc"],
       ["待审/候补", `${s.applications.PENDING} / ${s.applications.WAITLISTED}`, "#fcd34d"],
       ["已通过申请", s.applications.APPROVED, "#4ade80"],
+      ["待审变更", (s.changes ? s.changes.PENDING : 0), "#fca5a5"],
     ].map(([k, v, c]) => `<div class="stat"><b style="color:${c}">${v}</b>${k}</div>`).join("");
     $("clock").textContent = "服务器时间 " + fmtTime(s.now);
   } catch (_) {}
