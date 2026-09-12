@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShortPass · 门点核销台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="title">门点核销台</div>
+    <div class="row" style="max-width:560px">
+      <input id="gateId" placeholder="门点 ID（管理员注册）" style="max-width:200px">
+      <input id="gateToken" type="password" placeholder="门点令牌 (PASSPORT_GATE_TOKEN)">
+      <button class="btn primary" id="saveCfg">保存</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <div><span class="queue-dot off" id="net-dot"></span><span id="net-text">未配置</span></div>
+          <div class="muted" style="text-align:right;font-size:12px">
+            已同步到版本 <b id="cursor">#0</b>
+          </div>
+        </div>
+        <label style="margin-top:14px">票面编号（扫码枪/手输，回车提交）</label>
+        <input id="code" class="mono" style="font-size:18px;letter-spacing:1px"
+               placeholder="T-XXXXXXXX" autocomplete="off" autofocus>
+        <button class="btn primary big" id="btn-redeem" style="margin-top:12px;width:100%">核 销</button>
+
+        <div id="result"></div>
+
+        <div class="section">
+          <div class="muted" style="font-size:12px">
+            离线待补提交：<b id="queue-n">0</b> 条 ·
+            后台每 5 秒按版本号补齐撤销/核销/过期结果
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>本门点近期记录</h2>
+      <table>
+        <thead><tr><th>时间</th><th>票号</th><th>结果</th><th>说明</th></tr></thead>
+        <tbody id="history"></tbody>
+      </table>
+      <div class="section">
+        <h2>离线补齐日志（收到的状态变化事件）</h2>
+        <pre class="log" id="synclog">（尚无补齐事件）</pre>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/common.js"></script>
+<script src="/static/gate.js"></script>
+</body>
+</html>

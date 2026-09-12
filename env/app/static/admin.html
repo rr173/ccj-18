@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShortPass · 管理台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div>
+      <div class="title">ShortPass 管理台</div>
+      <div class="meta" id="clock"></div>
+    </div>
+    <div class="row" style="max-width:420px">
+      <input id="token" type="password" placeholder="管理员令牌 (PASSPORT_ADMIN_TOKEN)">
+      <button class="btn primary" id="saveToken">保存</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="pill-row" id="stats"></div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+    <!-- 左栏：操作 -->
+    <div>
+      <div class="card">
+        <h2>签发通行票</h2>
+        <label>人员标识（身份证/工号/手机号等）</label>
+        <input id="f-person" placeholder="例如 V-10086">
+        <div class="row">
+          <div>
+            <label>生效时间（留空=立即）</label>
+            <input id="f-from" type="datetime-local">
+          </div>
+          <div>
+            <label>有效期（分钟）</label>
+            <input id="f-min" type="number" min="1" value="60">
+          </div>
+        </div>
+        <label>备注</label>
+        <input id="f-note" placeholder="可选">
+        <button class="btn primary" id="btn-issue" style="margin-top:12px;width:100%">发票</button>
+        <div id="issue-result"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>按票面编号作废</h2>
+        <label>票面编号</label>
+        <input id="r-code" class="mono" placeholder="T-XXXXXXXX">
+        <label>作废原因</label>
+        <input id="r-reason" value="admin_revoke">
+        <button class="btn danger" id="btn-revoke" style="margin-top:12px;width:100%">作废该票（其他票不受影响）</button>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>门点管理</h2>
+        <div class="row">
+          <input id="g-id" placeholder="门点 ID，如 gate-east">
+          <input id="g-name" placeholder="名称，如 东门">
+        </div>
+        <button class="btn primary" id="btn-gate" style="margin-top:10px;width:100%">注册门点</button>
+        <div class="section" id="gates"></div>
+      </div>
+    </div>
+
+    <!-- 右栏：查询 -->
+    <div>
+      <div class="card">
+        <div class="tabs">
+          <button data-tab="person" class="btn active">按人查看</button>
+          <button data-tab="ticket" class="btn">按票查看</button>
+          <button data-tab="events" class="btn">状态流水</button>
+          <button data-tab="attempts" class="btn">门点记录</button>
+        </div>
+
+        <div id="tab-person">
+          <div class="row">
+            <input id="p-q" placeholder="人员标识（支持模糊）">
+            <button class="btn primary" id="btn-ps">搜索</button>
+            <button class="btn" id="btn-p-all">全部</button>
+          </div>
+          <div class="section" id="p-list"></div>
+          <div class="section" id="p-detail"></div>
+        </div>
+
+        <div id="tab-ticket" hidden>
+          <div class="row">
+            <input id="t-code" class="mono" placeholder="T-XXXXXXXX">
+            <button class="btn primary" id="btn-ticket">查询</button>
+          </div>
+          <div class="section" id="t-detail"></div>
+        </div>
+
+        <div id="tab-events" hidden>
+          <div class="row">
+            <input id="e-filter" placeholder="按票面编号或人员标识过滤（可选）">
+            <button class="btn primary" id="btn-events">刷新流水</button>
+          </div>
+          <div class="section"><table id="e-table"><thead>
+            <tr><th>版本</th><th>时间</th><th>类型</th><th>票号</th><th>人</th><th>门点</th><th>原因</th></tr>
+          </thead><tbody></tbody></table></div>
+        </div>
+
+        <div id="tab-attempts" hidden>
+          <div class="row">
+            <select id="a-gate"><option value="">全部门点</option></select>
+            <button class="btn primary" id="btn-attempts">刷新记录</button>
+          </div>
+          <div class="section"><table id="a-table"><thead>
+            <tr><th>时间</th><th>门点</th><th>票号</th><th>结果</th><th>状态</th><th>HTTP</th><th>attempt_id</th></tr>
+          </thead><tbody></tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/common.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>
