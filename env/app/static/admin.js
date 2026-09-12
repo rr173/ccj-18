@@ -21,9 +21,10 @@ document.querySelectorAll(".tabs button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    ["person", "ticket", "zone", "events", "attempts"].forEach(t =>
+    ["batch", "person", "ticket", "zone", "events", "attempts"].forEach(t =>
       $(`tab-${t}`).hidden = t !== btn.dataset.tab);
     if (btn.dataset.tab === "zone") loadZoneView();
+    if (btn.dataset.tab === "batch") loadBatchView();
   };
 });
 
@@ -152,6 +153,11 @@ async function loadZones() {
     $("f-zones").innerHTML = zones.length
       ? zones.map(z => `<label><input type="checkbox" value="${esc(z.id)}" checked>${esc(z.id)}</label>`).join("")
       : `<span class="muted">尚无分区，请先创建</span>`;
+    // 批次分区选择
+    const bz = $("b-zone");
+    if (bz) bz.innerHTML = zones.map(z =>
+      `<option value="${esc(z.id)}">${esc(z.id)} · ${esc(z.name)}</option>`).join("")
+      || `<option value="">（请先创建分区）</option>`;
     // 规则目标分区
     $("pr-zone").innerHTML = `<option value="">全局（所有分区）</option>` +
       zones.map(z => `<option value="${esc(z.id)}">${esc(z.id)} · ${esc(z.name)}</option>`).join("");
@@ -257,6 +263,229 @@ async function loadZoneView() {
 }
 
 
+// ---------------- 访客预约批次 ----------------
+let batchCache = [];
+
+function batchStateBadge(b) {
+  if (b.closed) return '<span class="badge REVOKED">已关闭</span>';
+  if (!b.accepting) return '<span class="badge EXPIRED">已结束</span>';
+  return b.remaining > 0
+    ? '<span class="badge ACTIVE">申请中</span>'
+    : '<span class="badge EXPIRED">满额候补</span>';
+}
+
+$("btn-batch").onclick = async () => {
+  try {
+    requireToken();
+    const zone_id = $("b-zone").value;
+    const visit_date = $("b-date").value;
+    const capacity = parseInt($("b-cap").value, 10);
+    if (!zone_id) return toast("请选择所属分区", "error");
+    if (!visit_date) return toast("请选择访问日期", "error");
+    if (!$("b-start").value || !$("b-end").value) return toast("请选择时段", "error");
+    if (!capacity || capacity < 1) return toast("人数上限无效", "error");
+    const b = await adminApi("POST", "/api/admin/batches", {
+      name: $("b-name").value.trim() || null,
+      visit_date,
+      start_at: new Date($("b-start").value).toISOString(),
+      end_at: new Date($("b-end").value).toISOString(),
+      zone_id, capacity,
+    });
+    const link = `${location.origin}/apply?k=${encodeURIComponent(b.apply_token)}`;
+    toast("批次已创建：" + b.id, "success");
+    $("b-name").value = "";
+    await loadBatches();
+    selectBatch(b.id);
+    $("bv-detail").insertAdjacentHTML("afterbegin",
+      `<div class="result-box ok" style="margin-bottom:12px">一次性申请链接（发给访客）：<br>
+        <span class="mono" style="word-break:break-all">${esc(link)}</span></div>`);
+  } catch (e) { toast("创建批次失败：" + e.message, "error"); }
+};
+
+async function loadBatches() {
+  try {
+    requireToken();
+    const { batches } = await adminApi("GET", "/api/admin/batches");
+    batchCache = batches;
+    $("batches").innerHTML = batches.length ? `<table><thead><tr>
+      <th>批次</th><th>时段 / 分区</th><th>名额</th><th>状态</th><th></th></tr></thead><tbody>` +
+      batches.map(b => {
+        const c = b.counts || {};
+        const cnt = s => (c[s] ? c[s].count : 0);
+        return `<tr>
+          <td class="mono">${esc(b.id)}${b.name ? "<div class='muted' style='font-size:11px'>" + esc(b.name) + "</div>" : ""}</td>
+          <td>${esc(b.visit_date)}<br><span class="muted" style="font-size:11px">${fmtTime(b.start_at)}~${fmtTime(b.end_at)} · ${esc(b.zone_id)}</span></td>
+          <td><b>${b.used}</b>/${b.capacity}<br><span class="muted" style="font-size:11px">候补 ${cnt("WAITLISTED")} 组</span></td>
+          <td>${batchStateBadge(b)}</td>
+          <td><button class="btn small" onclick="selectBatch('${esc(b.id)}')">详情</button></td>
+        </tr>`;
+      }).join("") + "</tbody></table>"
+      : `<p class="muted">尚无批次。</p>`;
+    $("bv-batch").innerHTML = batches.map(b =>
+      `<option value="${esc(b.id)}">${esc(b.id)} · ${esc(b.visit_date)} · ${esc(b.zone_id)}</option>`).join("");
+  } catch (e) { /* 未填令牌时静默 */ }
+}
+
+window.selectBatch = async id => {
+  $("bv-batch").value = id;
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("active", x.dataset.tab === "batch"));
+  ["batch", "person", "ticket", "zone", "events", "attempts"].forEach(t =>
+    $(`tab-${t}`).hidden = t !== "batch");
+  await loadBatchView();
+};
+$("btn-batchview").onclick = () => loadBatchView();
+
+const APP_BADGE = {
+  PENDING: "online", WAITLISTED: "offline", APPROVED: "ACTIVE",
+  CANCELLED: "REVOKED", REJECTED: "REVOKED", EXPIRED: "EXPIRED",
+};
+const APP_TEXT = {
+  PENDING: "待审核", WAITLISTED: "候补中", APPROVED: "已通过",
+  CANCELLED: "已取消", REJECTED: "已拒绝", EXPIRED: "已过期",
+};
+
+async function loadBatchView() {
+  try {
+    requireToken();
+    const id = $("bv-batch").value;
+    if (!id) { $("bv-detail").innerHTML = `<p class="muted">请先创建批次。</p>`; return; }
+    const v = await adminApi("GET", `/api/admin/batches/${encodeURIComponent(id)}`);
+    const b = v.batch;
+    const link = `${location.origin}/apply?k=${encodeURIComponent(b.apply_token)}`;
+    const capRows = v.capacity_log.map(l => `<tr>
+      <td>${fmtTime(l.changed_at)}</td>
+      <td>${l.old_capacity === null ? "（建批）" : l.old_capacity} → <b>${l.new_capacity}</b></td>
+      <td>${esc(l.reason || "")}</td>
+    </tr>`).join("");
+    const appRows = v.applications.map(a => `<tr>
+      <td>${a.seq}${a.status === "WAITLISTED" ? `<div class="muted">#候补${a.waitlist_position}</div>` : ""}</td>
+      <td>${esc(a.name)}<div class="muted" style="font-size:11px">${esc(a.contact)}</div></td>
+      <td>${a.party_size}${a.source === "admin" ? ' <span class="badge UNKNOWN">补录</span>' : ""}</td>
+      <td><span class="badge ${APP_BADGE[a.status] || "UNKNOWN"}">${APP_TEXT[a.status] || a.status}</span>
+          ${a.promoted_at ? `<div class="muted" style="font-size:11px">${fmtTime(a.promoted_at)} 晋级</div>` : ""}</td>
+      <td class="mono">${a.ticket_code
+        ? `${esc(a.ticket_code)}`
+        : "—"}</td>
+      <td>${esc(a.decide_reason || "")}</td>
+      <td>${actionButtons(a, b)}</td>
+    </tr>`).join("");
+    const ticketRows = v.tickets.map(t => `<tr>
+      <td class="mono code-cell">${esc(t.code)}</td>
+      <td>${badge(t.status)}</td>
+      <td>${t.party_size ?? ""}</td>
+      <td>${fmtTime(t.valid_from)}<br><span class="muted">至 ${fmtTime(t.valid_until)}</span></td>
+      <td>${t.redeemed_gate ? esc(t.redeemed_gate) + " @ " + fmtTime(t.redeemed_at) : "—"}</td>
+    </tr>`).join("");
+    const eventRows = v.events.map(e => `<tr>
+      <td class="mono">#${e.version}</td><td>${fmtTime(e.ts)}</td>
+      <td>${esc(e.type)}</td>
+      <td class="mono">${esc(e.application_id || "")}</td>
+      <td class="mono">${esc(e.ticket_code || "")}</td>
+      <td>${esc(e.reason || "")}</td>
+    </tr>`).join("");
+
+    $("bv-detail").innerHTML =
+      `<h2>${esc(b.id)} ${b.name ? "· " + esc(b.name) : ""} ${batchStateBadge(b)}</h2>
+       <table><tbody>
+        <tr><th>访问时段</th><td>${esc(b.visit_date)} · ${fmtTime(b.start_at)} ～ ${fmtTime(b.end_at)}</td></tr>
+        <tr><th>所属分区</th><td class="mono">${esc(b.zone_id)}（签发票的允许分区固定为本批次分区）</td></tr>
+        <tr><th>名额</th><td><b>${b.used}</b> / ${b.capacity} 已占 · 剩余 ${b.remaining}
+          · 候补 ${b.counts.WAITLISTED.count} 组</td></tr>
+        <tr><th>申请链接</th><td><span class="mono" style="word-break:break-all">${esc(link)}</span></td></tr>
+       </tbody></table>
+       <div class="row" style="margin-top:10px">
+         <input id="bv-cap" type="number" min="1" value="${b.capacity}" placeholder="新容量">
+         <input id="bv-capreason" placeholder="调整原因（可选）">
+         <button class="btn primary" onclick="changeCap('${esc(b.id)}')">调整容量</button>
+         ${b.closed || !b.accepting ? "" : `<button class="btn danger" onclick="closeBatch('${esc(b.id)}')">提前关闭申请</button>`}
+       </div>
+       <div class="row" style="margin-top:10px">
+         <input id="bf-name" placeholder="补录姓名">
+         <input id="bf-contact" placeholder="补录联系方式">
+         <input id="bf-comp" type="number" min="0" value="0" title="同行人数（不含本人）">
+         <button class="btn primary" onclick="backfill('${esc(b.id)}')">补录并通过签票</button>
+       </div>
+       <div class="section"><h2>申请（按提交顺序；候补名次即顺序）</h2>
+       <table><thead><tr><th>#</th><th>访客</th><th>人数</th><th>状态</th><th>通行票</th><th>原因/备注</th><th>操作</th></tr></thead>
+       <tbody>${appRows || '<tr><td colspan=7 class=muted>无申请</td></tr>'}</tbody></table></div>
+       <div class="section"><h2>已签发的票（${v.tickets.length}）</h2>
+       <table><thead><tr><th>票号</th><th>状态</th><th>人数</th><th>有效期</th><th>核销</th></tr></thead>
+       <tbody>${ticketRows || '<tr><td colspan=5 class=muted>无（仅审核通过/补录通过才签票；取消、过期、候补未晋级均无票）</td></tr>'}</tbody></table></div>
+       <div class="section"><h2>容量变化记录</h2>
+       <table><thead><tr><th>时间</th><th>容量</th><th>原因</th></tr></thead>
+       <tbody>${capRows}</tbody></table></div>
+       <div class="section"><h2>批次事件流水（版本号即全局事件版本，门点离线按此补齐）</h2>
+       <table><thead><tr><th>版本</th><th>时间</th><th>事件</th><th>申请</th><th>票号</th><th>原因</th></tr></thead>
+       <tbody>${eventRows || '<tr><td colspan=6 class=muted>无</td></tr>'}</tbody></table></div>`;
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function actionButtons(a, b) {
+  const id = a.id;
+  if (a.status === "PENDING")
+    return `<button class="btn small primary" onclick="decideApp('${id}','approve')">通过签票</button>
+            <button class="btn small danger" onclick="decideApp('${id}','reject')">拒绝</button>
+            <button class="btn small danger" onclick="decideApp('${id}','cancel')">取消</button>`;
+  if (a.status === "WAITLISTED")
+    return `<span class="muted">候补 #${a.waitlist_position}，释放名额时自动晋级</span>
+            <button class="btn small danger" onclick="decideApp('${id}','cancel')">取消</button>`;
+  if (a.status === "APPROVED")
+    return `<button class="btn small danger" onclick="decideApp('${id}','cancel')">取消（作发票并释放名额）</button>`;
+  return "";
+}
+
+window.decideApp = async (id, action) => {
+  const map = {
+    approve: ["POST", `通过申请 ${id}？将立即签发与批次分区一致的通行票。`, "审核通过并签票"],
+    reject: ["POST", `拒绝申请 ${id}？占座名额将按候补顺序释放。`, "admin_reject"],
+    cancel: ["POST", `取消申请 ${id}？已审核的票将作废，名额按候补顺序释放。`, "admin_cancel"],
+  };
+  const [, confirmText, reason] = map[action];
+  if (!confirm(confirmText)) return;
+  try {
+    if (action === "approve") {
+      const r = await adminApi("POST", `/api/admin/applications/${encodeURIComponent(id)}/approve`);
+      toast(`已通过并签票：${r.ticket.code}`, "success");
+    } else {
+      await adminApi("POST", `/api/admin/applications/${encodeURIComponent(id)}/${action}`, { reason });
+      toast(`申请已${action === "reject" ? "拒绝" : "取消"}`, "success");
+    }
+    await Promise.all([loadBatchView(), loadBatches(), loadStats()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.changeCap = async (id) => {
+  const capacity = parseInt($("bv-cap").value, 10);
+  if (!capacity) return toast("容量无效", "error");
+  try {
+    const r = await adminApi("PUT", `/api/admin/batches/${encodeURIComponent(id)}/capacity`,
+      { capacity, reason: $("bv-capreason").value.trim() || "admin_change" });
+    toast(`容量已调整为 ${capacity}` + (r.promoted && r.promoted.length ? `，候补晋级 ${r.promoted.length} 组` : ""), "success");
+    await Promise.all([loadBatchView(), loadBatches()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.closeBatch = async id => {
+  if (!confirm("提前关闭该批次的申请？已审核的票不受影响，候补不再晋级。")) return;
+  try {
+    await adminApi("POST", `/api/admin/batches/${encodeURIComponent(id)}/close`);
+    toast("批次已关闭", "success");
+    await Promise.all([loadBatchView(), loadBatches()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.backfill = async id => {
+  const name = $("bf-name").value.trim(), contact = $("bf-contact").value.trim();
+  const companions = parseInt($("bf-comp").value, 10);
+  if (!name || !contact) return toast("补录姓名与联系方式必填", "error");
+  try {
+    const r = await adminApi("POST", `/api/admin/batches/${encodeURIComponent(id)}/backfill`,
+      { name, contact, companions: isNaN(companions) ? 0 : companions });
+    toast(`补录成功，已签票：${r.ticket.code}`, "success");
+    await Promise.all([loadBatchView(), loadBatches(), loadStats()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
 // ---------------- 按人 ----------------
 async function loadPeople(q) {
   const { people } = await adminApi("GET", `/api/admin/people${q !== undefined && q !== null ? `?q=${encodeURIComponent(q)}` : ""}`);
@@ -344,17 +573,30 @@ $("btn-events").onclick = async () => {
     if (f.startsWith("T-")) url += `&code=${encodeURIComponent(f)}`;
     else if (f) url += `&person_id=${encodeURIComponent(f)}`;
     const { events } = await adminApi("GET", url);
-    $("e-table").querySelector("tbody").innerHTML = events.map(e => `<tr>
+    $("e-table").querySelector("tbody").innerHTML = events.map(e => {
+      let badgeHtml;
+      if (e.type === "POLICY_LOCK" || e.type === "BATCH_CLOSED"
+          || e.type === "APPLICATION_CANCELLED" || e.type === "APPLICATION_REJECTED") {
+        badgeHtml = '<span class="badge LOCKED">' + esc(e.type) + "</span>";
+      } else if (e.type === "TICKET_REDEEMED") {
+        badgeHtml = badge("REDEEMED") + esc(e.type.replace("TICKET_", ""));
+      } else if (e.type === "TICKET_REVOKED") {
+        badgeHtml = badge("REVOKED") + esc(e.type.replace("TICKET_", ""));
+      } else if (e.type === "TICKET_EXPIRED" || e.type === "APPLICATION_EXPIRED") {
+        badgeHtml = badge("EXPIRED") + esc(e.type);
+      } else if (e.type === "POLICY_UNLOCK") {
+        badgeHtml = '<span class="badge OPEN">UNLOCK</span>解锁';
+      } else {
+        badgeHtml = badge("ACTIVE") + esc(e.type.replace("TICKET_", ""));
+      }
+      const ref2 = e.application_id || (e.payload && e.payload.rule_id) || "";
+      return `<tr>
       <td class="mono">#${e.version}</td><td>${fmtTime(e.ts)}</td>
-      <td>${e.type === "POLICY_LOCK" ? '<span class="badge LOCKED">LOCK</span>封锁'
-        : e.type === "POLICY_UNLOCK" ? '<span class="badge OPEN">UNLOCK</span>解锁'
-        : badge(e.type === "TICKET_REDEEMED" ? "REDEEMED"
-        : e.type === "TICKET_REVOKED" ? "REVOKED"
-        : e.type === "TICKET_EXPIRED" ? "EXPIRED" : "ACTIVE") + esc(e.type.replace("TICKET_", ""))}</td>
-      <td class="mono">${esc(e.ticket_code || (e.payload && e.payload.rule_id) || "")}</td>
-      <td class="mono">${esc(e.person_id || (e.payload && e.payload.zone_id) || (e.type.startsWith("POLICY") ? "全局" : ""))}</td>
+      <td>${badgeHtml}</td>
+      <td class="mono">${esc(e.ticket_code || "")}</td>
+      <td class="mono">${esc(e.person_id || ref2 || (e.batch_id || (e.type.startsWith("POLICY") ? "全局" : "")))}</td>
       <td>${esc(e.gate_id || "")}</td><td>${esc(e.reason || "")}</td>
-    </tr>`).join("") || '<tr><td colspan=7 class=muted>无事件</td></tr>';
+    </tr>`; }).join("") || '<tr><td colspan=7 class=muted>无事件</td></tr>';
   } catch (e) { toast(e.message, "error"); }
 };
 
@@ -389,6 +631,9 @@ async function loadStats() {
       ["门点", `${s.gates}（停用 ${s.gates_revoked}）`, "#cbd5e1"],
       ["分区", `${s.zones}（封锁 ${s.zones_locked}）`, s.zones_locked ? "#fca5a5" : "#cbd5e1"],
       ["策略版本", "#" + s.policy_version, "#c4b5fd"],
+      ["预约批次", `${s.batches}（开放 ${s.batches_open}）`, "#7dd3fc"],
+      ["待审/候补", `${s.applications.PENDING} / ${s.applications.WAITLISTED}`, "#fcd34d"],
+      ["已通过申请", s.applications.APPROVED, "#4ade80"],
     ].map(([k, v, c]) => `<div class="stat"><b style="color:${c}">${v}</b>${k}</div>`).join("");
     $("clock").textContent = "服务器时间 " + fmtTime(s.now);
   } catch (_) {}
@@ -396,7 +641,7 @@ async function loadStats() {
 
 function refreshAll() {
   loadStats();
-  loadZones().then(() => { loadGates(); loadZoneView(); });
+  loadZones().then(() => { loadGates(); loadZoneView(); loadBatches().then(loadBatchView); });
   loadRules();
   try { loadPeople(""); } catch (_) {}
   $("btn-events").click();

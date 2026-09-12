@@ -4,7 +4,11 @@
 
 - **FastAPI + SQLite(WAL)**，单容器即可部署；数据落盘在 `/data` 卷，重启不丢状态。
 - 无外部前端依赖（原生 HTML/JS），自带管理台与门点核销台。
-- `tests/` 含 20 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
+- 访客预约批次模块：管理员建批（日期/时段/分区/人数上限）→ 访客凭一次性链接申请
+  （姓名/联系方式/同行人数，请求幂等）→ 容量内待审核、满额按提交时间进候补队列 →
+  管理员审核/取消/拒绝/补录，取消已审核即作发票并按 FIFO 释放名额给候补 →
+  审核通过在同一事务签发与批次分区一致的通行票；门点核销可见批次与同行总人数。
+- `tests/` 含 33 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
 
 ## 需求对应的关键保证
 
@@ -25,6 +29,24 @@
 | 策略变更与并发核销有明确先后 | 规则发布与核销都走 `BEGIN IMMEDIATE` 写事务串行化：核销事件版本 < 规则版本 ⇒ 按旧策略放行，反之按新策略判定；核销响应与事件都记录判定时的 `policy_version` |
 | 门点规则版本过旧要明示 | 核销请求携带 `policy_version`（门点已同步的最新策略版本）；落后于服务器 → 409 `stale_policy` 并附 `current_policy_version`；该结果**不写入**扫码记录，门点按版本补齐后可用同一 `attempt_id` 安全重试 |
 | 管理员按分区查看当前规则、受影响票据、门点执行记录 | `GET /api/admin/zones/{id}` 返回：当前规则与全部历史、允许该分区的票据、本分区门点的扫码执行记录；`GET /api/admin/zones` 为总览（封锁状态/门点数/受影响票数） |
+
+### 访客预约批次的关键保证
+
+| 需求 | 实现方式 |
+|---|---|
+| 管理员建批：日期、时段、所属分区、人数上限 | `POST /api/admin/batches`；批次带秘密 `apply_token`，申请链接形如 `/apply?k=<token>`；容量调整在 `batch_capacity_log` append-only 留痕并产生 `BATCH_CAPACITY_CHANGED` 事件 |
+| 访客一次性链接提交姓名/联系方式/同行人数 | 公开端点（无 Bearer，鉴权靠链接令牌）`POST /api/public/batches/{token}/applications`；同行人数不含本人，**整组**（1+同行人）占用名额 |
+| 同一申请请求重复提交必须幂等 | 表单“一次提交动作”生成一个 `request_id`（唯一约束），双击/网络重发返回首次结果并带 `replayed=true`（200）；同 `request_id` 不同载荷返回 409 |
+| 多访客同时申请不超容量 | 提交在单个 `BEGIN IMMEDIATE` 事务内分配批次内单调 `seq` 并判定 `used + party_size <= capacity`，数据库层串行化；测试以 20 线程抢 10 席验证恰好 10 个在容量内 |
+| 满额进入按提交时间排序的候补队列 | 放不下即为 `WAITLISTED`，候补名次按 `seq`；后台/管理视图按名次展示。释放名额时严格 FIFO：队首整组放得下才晋级，**放得下但后面的团体更小也不跳过队首** |
+| 审核 / 取消 / 拒绝 / 补录 | 管理端三个决定端点 + `POST .../backfill`（补录默认直接通过签票，同样受容量约束，超容量 409，不会留下“通过但无票”）；候补不能越级通过（409），必须先晋级 |
+| 取消已审核申请按候补顺序释放名额 | 取消在同一事务内先作废通行票（票已核销=访客已到场则拒绝取消，409），再 `APPLICATION_CANCELLED`，最后 FIFO 晋级候补（可连续晋级多组）；拒绝/取消待审核申请同样触发晋级 |
+| 审核通过自动签发与批次分区一致的票 | 审核与发票在**同一 IMMEDIATE 事务**：票 `zones=[批次.zone_id]`，`tickets.batch_id/application_id/party_size` 关联；票有效期默认覆盖批次时段（审核时不早于当前时刻） |
+| 取消、过期、候补未晋级不产生可用票 | 这些路径完全不调发票；已审核取消则票立即 `REVOKED`；批次结束后清扫线程把未决申请置 `EXPIRED`（`APPLICATION_EXPIRED` 事件），申请终态机 `PENDING/WAITLISTED → APPROVED/CANCELLED/REJECTED/EXPIRED` 不可逆 |
+| 门点核销看到批次和同行人数 | 核销响应（含幂等重放）附 `appointment: {batch_id, batch_name, visit_date, zone_id, applicant_name, party_size, ...}`，门点台大字显示批次与“同行共 N 人”，历史记录同样展示 |
+| 离线重连按版本补齐预约与票据变化 | 预约事件（`BATCH_*` / `APPLICATION_*`）与票据/策略事件共用同一 append-only 版本流，门点 `/api/gate/sync` 无需改造即可按版本补齐 |
+| 管理员按批次查看申请、候补顺序、已签发票、容量变化 | `GET /api/admin/batches/{id}`：批次占用计数、全部申请（含候补名次/晋级时间）、候补队列、已签发票、`batch_capacity_log`、批次事件流水 |
+| 批次提前关闭 / 容量调整 | `POST .../close` 停止接受新申请（已签票不受影响）；`PUT .../capacity` 不允许低于当前占座数，调高时同事务自动晋级候补 |
 
 ### 核销响应约定（门点端可直接据此亮灯/播报）
 
@@ -88,6 +110,7 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 4. 紧急情况下在「分区与紧急封锁」发布规则：选封锁/解除、目标分区（或全局）、填规则 ID（留空自动生成）与原因；发布即产生新版本，重复发布同一规则 ID 不会重复生效。
 5. 网络断开时扫码进入本地队列，重连后自动补提交；同时按版本号补齐离线期间的作废/核销/过期/**封锁规则**事件，页面显示补齐日志与当前策略版本。若核销被拒为“规则版本过旧”，门点会自动补齐后用同一次扫码重试。
 6. 管理台「按分区查看」可看到：分区当前规则与历史版本、受影响票据、本分区门点的执行记录；「按人查看」可看到：当前可用票数、每张票的终态与原因、状态流水版本、各门点扫码成功/拒绝记录。
+7. 访客预约：「访客预约批次」卡片填日期/时段/分区/人数上限建批，复制生成的 `/apply?k=…` 链接发给访客；访客提交后容量内为“待审核”，满额自动进候补。右侧「预约批次」标签可按批次审核/取消/拒绝/补录、调整容量、关闭申请、查看候补顺序、已签发票与容量变化记录。
 
 ## API 摘要
 
@@ -106,6 +129,25 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 - `GET  /api/admin/attempts?gate_id=` （门点扫码记录）
 - `GET  /api/admin/stats`
 
+访客预约批次（管理端，Bearer 管理员令牌）
+
+- `POST /api/admin/batches` `{visit_date, start_at, end_at, zone_id, capacity, name?}` → 批次 + `apply_token`（申请链接令牌）
+- `GET  /api/admin/batches` / `GET  /api/admin/batches/{id}`（申请/候补顺序/已签发票/容量变化/事件流水）
+- `PUT  /api/admin/batches/{id}/capacity` `{capacity, reason?}`（不可低于当前占座；调高自动 FIFO 晋级候补）
+- `POST /api/admin/batches/{id}/close`（提前关闭申请，已签票不受影响）
+- `POST /api/admin/batches/{id}/backfill` `{name, contact, companions, approve=true}`（管理员补录，同事务签票，受容量约束）
+- `POST /api/admin/applications/{id}/approve`（同事务签发与批次分区一致的票）
+- `POST /api/admin/applications/{id}/reject` / `cancel` `{reason}`（取消已审核先作发票，再按候补顺序释放名额）
+- `GET  /api/admin/events?batch_id=`（批次事件过滤）
+
+访客端（公开，无 Bearer；授权靠一次性链接令牌）
+
+- `GET  /api/public/batches/{apply_token}`（批次信息：时段/分区/剩余名额/候补组数）
+- `POST /api/public/batches/{apply_token}/applications` `{request_id, name, contact, companions}`
+  → 201 新申请（`PENDING`/`WAITLISTED`）；同 `request_id` 重放 → 200 `replayed=true`；同键不同载荷 → 409；批次结束/关闭 → 410
+- `GET  /api/public/applications/{manage_token}`（访客查询自身申请状态、候补名次、签发票号）
+- 申请页：`/apply?k=<apply_token>`
+
 门点端（`Authorization: Bearer <PASSPORT_GATE_TOKEN>`）
 
 - `POST /api/gate/redeem` `{gate_id, code, attempt_id, policy_version}`
@@ -117,21 +159,27 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```bash
 pip install pytest httpx
 python3 -m pytest tests/ -q
-# 20 passed
+# 33 passed
 ```
 
 测试启动真实 uvicorn 子进程打真实 HTTP，包含：双门点线程屏障并发核销（连跑多轮验证）、
 同人三票独立核销、作废隔离、过期不复活、幂等重放、离线游标补齐、**杀进程重启后终态不复活且版本号延续**、门点停用、鉴权，
 以及分区与封锁：分区不匹配不消耗票据、缺少策略/未知分区默认拒绝、封锁-版本过旧-解锁全流程、
-全局封锁、规则幂等重发与冲突、策略事件离线补齐、**封锁发布与并发核销的先后序验证**、按分区的管理视图。
+全局封锁、规则幂等重发与冲突、策略事件离线补齐、**封锁发布与并发核销的先后序验证**、按分区的管理视图；
+预约批次：批次创建与链接校验、申请幂等（重放/载荷冲突）、**20 线程抢 10 席不超售**、
+候补 FIFO（不跳过放不下的队首）、审核自动签同分区票且候补不可越级、取消已审核同事务作发票并晋级、
+票已核销不可取消、补录受容量约束、容量调整留痕与上下限、批次到期清扫无票、门点同步补齐预约事件、
+核销可见批次与同行人数、**重启后申请/票/链接幂等全部延续**。
 
 > 注意：`tests/test_zones.py` 依赖在 `test_system.py` 之后运行（pytest 默认按文件名字序），
 > 因为 test_system 的用例假定“尚未发布任何封锁规则”（门点策略版本为 0）。
 
 ## 升级说明（老库迁移）
 
-启动时自动就地迁移：`gates` 加 `zone_id` 列、`tickets` 加 `zones` 列（默认 `[]`）、
-重建 `events` 表以扩展事件类型 CHECK（事件与版本号完整保留、继续递增）。
+启动时自动就地迁移：`gates` 加 `zone_id` 列、`tickets` 加 `zones` 列（默认 `[]`）并在引入
+预约批次后再加 `batch_id` / `application_id` / `party_size` 列、
+重建 `events` 表以扩展事件类型 CHECK（并加 `batch_id` / `application_id` 列），
+新建 `batches` / `applications` / `batch_capacity_log` 表（事件与版本号完整保留、继续递增）。
 **注意**：升级前已存在的票 `zones` 为空数组，按“未授权任何分区”处理，在所有门点都会被
 `zone_mismatch` 拒绝；需要的话请作废旧票并按分区重新签发。
 

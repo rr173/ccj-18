@@ -49,6 +49,36 @@
       </div>
 
       <div class="card" style="margin-top:16px">
+        <h2>访客预约批次</h2>
+        <label>批次名称（可选）</label>
+        <input id="b-name" placeholder="例如 供应商参观-上午场">
+        <div class="row">
+          <div>
+            <label>访问日期</label>
+            <input id="b-date" type="date">
+          </div>
+          <div>
+            <label>人数上限（含同行人）</label>
+            <input id="b-cap" type="number" min="1" value="10">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>时段开始</label>
+            <input id="b-start" type="datetime-local">
+          </div>
+          <div>
+            <label>时段结束</label>
+            <input id="b-end" type="datetime-local">
+          </div>
+        </div>
+        <label>所属分区（审核通过后签发的票仅允许该分区）</label>
+        <select id="b-zone"></select>
+        <button class="btn primary" id="btn-batch" style="margin-top:12px;width:100%">创建批次</button>
+        <div class="section" id="batches"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
         <h2>按票面编号作废</h2>
         <label>票面编号</label>
         <input id="r-code" class="mono" placeholder="T-XXXXXXXX">
@@ -97,14 +127,23 @@
     <div>
       <div class="card">
         <div class="tabs">
-          <button data-tab="person" class="btn active">按人查看</button>
+          <button data-tab="batch" class="btn active">预约批次</button>
+          <button data-tab="person" class="btn">按人查看</button>
           <button data-tab="ticket" class="btn">按票查看</button>
           <button data-tab="zone" class="btn">按分区查看</button>
           <button data-tab="events" class="btn">状态流水</button>
           <button data-tab="attempts" class="btn">门点记录</button>
         </div>
 
-        <div id="tab-person">
+        <div id="tab-batch">
+          <div class="row">
+            <select id="bv-batch"></select>
+            <button class="btn primary" id="btn-batchview">查看批次</button>
+          </div>
+          <div class="section" id="bv-detail"></div>
+        </div>
+
+        <div id="tab-person" hidden>
           <div class="row">
             <input id="p-q" placeholder="人员标识（支持模糊）">
             <button class="btn primary" id="btn-ps">搜索</button>

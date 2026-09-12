@@ -54,7 +54,7 @@ function renderHistory() {
   const h = getHist();
   $("history").innerHTML = h.map(x => `<tr>
     <td>${fmtTime(x.ts)}</td>
-    <td class="mono">${esc(x.code)}</td>
+    <td class="mono">${esc(x.code)}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人</div>` : ""}</td>
     <td><span class="badge ${x.ok ? "ok" : "fail"}">${x.ok ? "放行" : "拒绝"}</span></td>
     <td>${esc(x.detail || x.status || "")}${x.replayed ? " <span class='muted'>(幂等重放)</span>" : ""}</td>
   </tr>`).join("") || '<tr><td colspan=4 class="muted">暂无</td></tr>';
@@ -63,11 +63,16 @@ function renderHistory() {
 function showResult(r, httpStatus, replayed) {
   const ok = r.ok;
   const detail = r.reason_text || r.status;
+  const a = r.appointment;
   $("result").innerHTML = `<div class="result-box ${ok ? "ok" : "fail"}">
     <div>${ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销"} ${httpStatus === 409 && r.reason === "already_redeemed" ? "（该票已使用）" : ""}</div>
     <div class="big-code">${esc(r.code || "")}</div>
     <div class="detail">
       ${r.person_id ? "持票人 " + esc(r.person_id) + " · " : ""}状态 ${esc(r.status)} · ${esc(detail)}
+      ${a ? `<br>🏷️ 批次 <b>${esc(a.batch_id)}</b>${a.batch_name ? "（" + esc(a.batch_name) + "）" : ""}
+             ${a.visit_date ? " · " + esc(a.visit_date) : ""}
+             · 访客 <b>${esc(a.applicant_name || "")}</b>
+             · <b>同行共 ${a.party_size} 人</b>` : ""}
       ${r.redeemed_gate ? "<br>已由门点 <b>" + esc(r.redeemed_gate) + "</b> 于 " + fmtTime(r.redeemed_at) + " 核销" : ""}
       ${r.revoked_reason ? "<br>作废原因：" + esc(r.revoked_reason) : ""}
       ${r.reason === "zone_mismatch" ? "<br>本门点分区 <b>" + esc(r.zone_id || "") + "</b>，票据允许分区：" + esc((r.ticket_zones || []).join("、") || "（无）") : ""}
@@ -138,6 +143,8 @@ async function flushQueue() {
         status: r.status,
         detail: r.reason_text || "",
         replayed: !!r.replayed,
+        party_size: r.appointment ? r.appointment.party_size : null,
+        applicant: r.appointment ? r.appointment.applicant_name : null,
       });
       setHist(h);
       if (!r.replayed) showResult(r, r.ok ? 200 : (r.reason === "already_redeemed" ? 409 : 410), false);
@@ -167,8 +174,11 @@ async function sync() {
         gate_id: gateId(), since_version: getCursor(),
       });
       for (const e of data.events) {
+        const target = e.ticket_code
+          ? ` ${e.ticket_code}`
+          : (e.application_id ? ` ${e.application_id}` + (e.batch_id ? ` @${e.batch_id}` : "") : (e.batch_id ? ` @${e.batch_id}` : ""));
         lines.push(`#${e.version} ${fmtTime(e.ts)} ${e.type}` +
-          (e.ticket_code ? ` ${e.ticket_code}` : "") +
+          target +
           (e.gate_id ? ` @${e.gate_id}` : "") +
           (e.reason ? ` reason=${e.reason}` : ""));
         setCursor(e.version);

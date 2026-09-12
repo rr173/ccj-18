@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from typing import Optional
 
 import uvicorn
@@ -134,6 +135,41 @@ class SyncIn(BaseModel):
     since_version: int = Field(default=0, ge=0)
 
 
+# ---------------- 访客预约批次模型 ----------------
+
+class BatchIn(BaseModel):
+    visit_date: str = Field(min_length=4, max_length=10)  # YYYY-MM-DD
+    start_at: str = Field(min_length=5)   # ISO8601 时段开始
+    end_at: str = Field(min_length=5)     # ISO8601 时段结束
+    zone_id: str = Field(min_length=1, max_length=64)
+    capacity: int = Field(ge=1, le=100000)
+    name: Optional[str] = Field(default=None, max_length=128)
+
+
+class CapacityIn(BaseModel):
+    capacity: int = Field(ge=1, le=100000)
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class BackfillIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    contact: str = Field(min_length=1, max_length=128)
+    companions: int = Field(default=0, ge=0, le=1000)  # 同行人数（不含申请人）
+    reason: Optional[str] = Field(default=None, max_length=300)
+    approve: bool = True  # false = 仅补录为待审核（占座，仍受容量约束）
+
+
+class DecideIn(BaseModel):
+    reason: str = Field(default="admin_action", max_length=300)
+
+
+class ApplicationSubmitIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128)  # 浏览器生成的 UUID
+    name: str = Field(min_length=1, max_length=128)
+    contact: str = Field(min_length=1, max_length=128)
+    companions: int = Field(default=0, ge=0, le=1000)
+
+
 # ---------------- 健康检查 / 页面 ----------------
 
 @app.get("/healthz")
@@ -154,6 +190,12 @@ def admin_page():
 @app.get("/gate")
 def gate_page():
     return FileResponse(os.path.join(STATIC_DIR, "gate.html"))
+
+
+@app.get("/apply")
+def apply_page():
+    # 访客申请页：链接形如 /apply?k=<apply_token>，令牌由页面 JS 读取
+    return FileResponse(os.path.join(STATIC_DIR, "apply.html"))
 
 
 # ---------------- 管理端 API ----------------
@@ -342,11 +384,13 @@ def admin_events(
     since: Optional[int] = Query(default=None),
     code: Optional[str] = Query(default=None),
     person_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     return {"events": services.list_events(
-        conn, since=since, code=code, person_id=person_id, limit=limit
+        conn, since=since, code=code, person_id=person_id,
+        batch_id=batch_id, limit=limit
     )}
 
 
@@ -362,6 +406,191 @@ def admin_attempts(
 @app.get("/api/admin/stats", dependencies=[Depends(require_admin)])
 def admin_stats(conn: sqlite3.Connection = Depends(get_conn)):
     return services.stats(conn)
+
+
+# ---------------- 访客预约批次（管理端） ----------------
+
+@app.post("/api/admin/batches", dependencies=[Depends(require_admin)])
+def admin_create_batch(body: BatchIn, conn: sqlite3.Connection = Depends(get_conn)):
+    try:
+        start = parse_dt(body.start_at)
+        end = parse_dt(body.end_at)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"时间格式错误: {e}")
+    if end <= start:
+        raise HTTPException(status_code=400, detail="时段结束必须晚于开始")
+    try:
+        datetime.strptime(body.visit_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="visit_date 必须是 YYYY-MM-DD")
+    if services.get_zone(conn, body.zone_id) is None:
+        raise HTTPException(status_code=400, detail=f"未知分区: {body.zone_id}")
+    batch = services.create_batch(
+        conn,
+        visit_date=body.visit_date,
+        start_at=iso(start),
+        end_at=iso(end),
+        zone_id=body.zone_id,
+        capacity=body.capacity,
+        name=body.name.strip() if body.name else None,
+    )
+    conn.commit()
+    return batch
+
+
+@app.get("/api/admin/batches", dependencies=[Depends(require_admin)])
+def admin_list_batches(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"batches": services.list_batches(conn)}
+
+
+@app.get("/api/admin/batches/{batch_id}", dependencies=[Depends(require_admin)])
+def admin_batch_detail(batch_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = services.batch_detail(conn, batch_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return detail
+
+
+@app.post("/api/admin/batches/{batch_id}/close", dependencies=[Depends(require_admin)])
+def admin_close_batch(batch_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    result = services.close_batch(conn, batch_id=batch_id)
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.put("/api/admin/batches/{batch_id}/capacity", dependencies=[Depends(require_admin)])
+def admin_change_capacity(
+    batch_id: str, body: CapacityIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.change_batch_capacity(
+        conn, batch_id=batch_id, new_capacity=body.capacity, reason=body.reason
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.post("/api/admin/batches/{batch_id}/backfill", dependencies=[Depends(require_admin)])
+def admin_backfill(
+    batch_id: str, body: BackfillIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.backfill_application(
+        conn,
+        batch_id=batch_id,
+        name=body.name.strip(),
+        contact=body.contact.strip(),
+        companions=body.companions,
+        reason=body.reason,
+        approve=body.approve,
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    if result["http_status"] == 410:
+        raise HTTPException(status_code=410, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return JSONResponse(status_code=201, content=result)
+
+
+@app.post("/api/admin/applications/{application_id}/approve",
+          dependencies=[Depends(require_admin)])
+def admin_approve_application(
+    application_id: str, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.approve_application(conn, application_id=application_id)
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    if result["http_status"] == 410:
+        raise HTTPException(status_code=410, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.post("/api/admin/applications/{application_id}/reject",
+          dependencies=[Depends(require_admin)])
+def admin_reject_application(
+    application_id: str, body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.reject_application(
+        conn, application_id=application_id, reason=body.reason
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.post("/api/admin/applications/{application_id}/cancel",
+          dependencies=[Depends(require_admin)])
+def admin_cancel_application(
+    application_id: str, body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.cancel_application(
+        conn, application_id=application_id, reason=body.reason
+    )
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+# ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
+
+@app.get("/api/public/batches/{token}")
+def public_batch(token: str, conn: sqlite3.Connection = Depends(get_conn)):
+    view = services.public_batch_view(conn, token)
+    if view is None:
+        raise HTTPException(status_code=404, detail="申请链接无效或批次不存在")
+    return view
+
+
+@app.post("/api/public/batches/{token}/applications")
+def public_submit(
+    token: str, body: ApplicationSubmitIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    result = services.submit_application(
+        conn,
+        apply_token=token,
+        request_id=body.request_id.strip(),
+        name=body.name.strip(),
+        contact=body.contact.strip(),
+        companions=body.companions,
+    )
+    status = result.pop("http_status", 200)
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    if status == 410:
+        raise HTTPException(status_code=410, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.get("/api/public/applications/{manage_token}")
+def public_application(manage_token: str, conn: sqlite3.Connection = Depends(get_conn)):
+    view = services.public_application_view(conn, manage_token)
+    if view is None:
+        raise HTTPException(status_code=404, detail="申请不存在或链接无效")
+    return view
 
 
 # ---------------- 门点 API ----------------
@@ -412,6 +641,11 @@ def _sweeper_loop() -> None:
                 expired = services.sweep_expired(conn)
                 if expired:
                     app.state.expired_total = getattr(app.state, "expired_total", 0) + len(expired)
+                expired_apps = services.sweep_applications(conn)
+                if expired_apps:
+                    app.state.expired_apps_total = (
+                        getattr(app.state, "expired_apps_total", 0) + len(expired_apps)
+                    )
             except sqlite3.Error:
                 # 下一轮重试，绝不让清扫线程死掉
                 time.sleep(1)

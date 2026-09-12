@@ -11,10 +11,11 @@
   <h1>ShortPass</h1>
   <p class="sub">短时通行票 · 多门点并发核销</p>
   <div class="landing-links">
-    <a class="btn primary big" href="/admin">管理台（发票 / 作废 / 查询）</a>
+    <a class="btn primary big" href="/admin">管理台（批次 / 发票 / 作废 / 查询）</a>
     <a class="btn big" href="/gate">门点核销台（扫码 / 离线补齐）</a>
   </div>
-  <p class="hint">两个入口使用不同的访问令牌（Bearer Token）。</p>
+  <p class="hint">两个入口使用不同的访问令牌（Bearer Token）。访客申请入口为
+    管理员创建批次后生成的一次性链接 <span class="mono">/apply?k=…</span>，无需令牌。</p>
 </main>
 </body>
 </html>

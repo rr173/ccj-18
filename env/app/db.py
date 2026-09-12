@@ -17,6 +17,10 @@
    （重复发布同一规则不重复生效）；每次发布同时写一条
    ``POLICY_LOCK`` / ``POLICY_UNLOCK`` 事件，版本号即 ``events.id``，
    门点离线重连后与票据事件一起按版本补齐。
+8. 访客预约批次：``batches``（日期/时段/分区/容量/一次性申请令牌）、
+   ``applications``（申请、审核状态与候补序号）、``batch_capacity_log``
+   （容量变化 append-only）。申请、审核、候补晋级、补录、改容量都在
+   IMMEDIATE 事务内串行完成，保证并发申请不超容量、取消即按候补顺序释放。
 """
 
 from __future__ import annotations
@@ -38,8 +42,33 @@ EVENT_TYPES = (
     "TICKET_EXPIRED",
     "POLICY_LOCK",
     "POLICY_UNLOCK",
+    # 访客预约批次
+    "BATCH_CREATED",
+    "BATCH_CLOSED",
+    "BATCH_CAPACITY_CHANGED",
+    "APPLICATION_SUBMITTED",
+    "APPLICATION_PROMOTED",
+    "APPLICATION_APPROVED",
+    "APPLICATION_CANCELLED",
+    "APPLICATION_REJECTED",
+    "APPLICATION_EXPIRED",
 )
 RULE_ACTIONS = ("LOCK", "UNLOCK")
+
+# 申请状态机：
+#   PENDING（在容量内，待审核）/ WAITLISTED（满额候补，按 seq 排序）
+#   -> APPROVED（已审核，自动签发票）/ CANCELLED / REJECTED / EXPIRED
+# 后四个均为终态，无任何路径回退。
+APPLICATION_STATUSES = (
+    "PENDING",
+    "WAITLISTED",
+    "APPROVED",
+    "CANCELLED",
+    "REJECTED",
+    "EXPIRED",
+)
+# 占名额的状态（待审核占座 + 已审核占座）
+CAPACITY_HOLDING_STATUSES = ("PENDING", "APPROVED")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS zones (
@@ -70,23 +99,31 @@ CREATE TABLE IF NOT EXISTS tickets (
     revoked_reason TEXT,
     expired_at     TEXT,
     note           TEXT,
-    zones          TEXT NOT NULL DEFAULT '[]'  -- JSON 数组：允许通行的分区
+    zones          TEXT NOT NULL DEFAULT '[]',  -- JSON 数组：允许通行的分区
+    batch_id       TEXT,            -- 预约批次签发的票：所属批次
+    application_id TEXT,            -- 预约批次签发的票：对应申请
+    party_size     INTEGER          -- 预约批次签发的票：同行总人数（含申请人）
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_person ON tickets(person_id);
 
 -- 只追加事件流水：id 即全局版本号（AUTOINCREMENT 保证单调、不复用）
 CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT NOT NULL,
-    type        TEXT NOT NULL
-                CHECK (type IN ('TICKET_ISSUED','TICKET_REDEEMED',
-                                'TICKET_REVOKED','TICKET_EXPIRED',
-                                'POLICY_LOCK','POLICY_UNLOCK')),
-    ticket_code TEXT,
-    person_id   TEXT,
-    gate_id     TEXT,
-    reason      TEXT,
-    payload     TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    type           TEXT NOT NULL
+                     CHECK (type IN (
+                       'TICKET_ISSUED','TICKET_REDEEMED','TICKET_REVOKED','TICKET_EXPIRED',
+                       'POLICY_LOCK','POLICY_UNLOCK',
+                       'BATCH_CREATED','BATCH_CLOSED','BATCH_CAPACITY_CHANGED',
+                       'APPLICATION_SUBMITTED','APPLICATION_PROMOTED','APPLICATION_APPROVED',
+                       'APPLICATION_CANCELLED','APPLICATION_REJECTED','APPLICATION_EXPIRED')),
+    ticket_code    TEXT,
+    person_id      TEXT,
+    gate_id        TEXT,
+    reason         TEXT,
+    payload        TEXT NOT NULL,
+    batch_id       TEXT,
+    application_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
@@ -123,6 +160,58 @@ CREATE TABLE IF NOT EXISTS gate_cursors (
     last_version INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL
 );
+
+-- 访客预约批次
+CREATE TABLE IF NOT EXISTS batches (
+    id          TEXT PRIMARY KEY,           -- B-XXXXXXXX
+    name        TEXT,                        -- 批次名称（可选）
+    visit_date  TEXT NOT NULL,               -- YYYY-MM-DD（访问日期）
+    start_at    TEXT NOT NULL,               -- 时段开始 ISO8601
+    end_at      TEXT NOT NULL,               -- 时段结束 ISO8601
+    zone_id     TEXT NOT NULL,               -- 所属分区
+    capacity    INTEGER NOT NULL CHECK (capacity > 0),  -- 人数上限（含同行人）
+    apply_token TEXT NOT NULL UNIQUE,        -- 一次性申请链接的秘密令牌
+    created_at  TEXT NOT NULL,
+    closed_at   TEXT                          -- 管理员提前关闭申请；NULL=开放
+);
+CREATE INDEX IF NOT EXISTS idx_batches_date ON batches(visit_date);
+
+-- 访客申请：同一批次 seq 即提交顺序（候补队列按它排序）
+CREATE TABLE IF NOT EXISTS applications (
+    id            TEXT PRIMARY KEY,          -- A-XXXXXXXX
+    batch_id      TEXT NOT NULL,
+    seq           INTEGER NOT NULL,          -- 批次内提交序号，事务内分配
+    name          TEXT NOT NULL,
+    contact       TEXT NOT NULL,
+    party_size    INTEGER NOT NULL CHECK (party_size >= 1),  -- 总人数（1+同行人数）
+    companions    INTEGER NOT NULL DEFAULT 0,-- 同行人数（不含申请人）
+    status        TEXT NOT NULL
+                  CHECK (status IN ('PENDING','WAITLISTED','APPROVED',
+                                    'CANCELLED','REJECTED','EXPIRED')),
+    source        TEXT NOT NULL DEFAULT 'visitor'
+                  CHECK (source IN ('visitor','admin')),
+    request_id    TEXT UNIQUE,               -- 访客请求幂等键（浏览器生成的 UUID）
+    manage_token  TEXT UNIQUE,               -- 访客查询自身申请状态的一次性令牌
+    created_at    TEXT NOT NULL,
+    promoted_at   TEXT,                      -- 候补晋级（WAITLISTED->PENDING）时间
+    decided_at    TEXT,                      -- 审核/取消/拒绝/过期终态时间
+    decide_reason TEXT,
+    ticket_code   TEXT UNIQUE                -- 审核通过后自动签发的票
+);
+CREATE INDEX IF NOT EXISTS idx_apps_batch ON applications(batch_id);
+CREATE INDEX IF NOT EXISTS idx_apps_status ON applications(batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_apps_ticket ON applications(ticket_code);
+
+-- 容量变化记录（append-only）：建批与每次调整各一条
+CREATE TABLE IF NOT EXISTS batch_capacity_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     TEXT NOT NULL,
+    old_capacity INTEGER,                    -- NULL = 建批
+    new_capacity INTEGER NOT NULL,
+    reason       TEXT,
+    changed_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_caplog_batch ON batch_capacity_log(batch_id);
 """
 
 
@@ -180,31 +269,51 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE tickets ADD COLUMN zones TEXT NOT NULL DEFAULT '[]'"
         )
+    if "batch_id" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN batch_id TEXT")
+    if "application_id" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN application_id TEXT")
+    if "party_size" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN party_size INTEGER")
+
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
     ).fetchone()
-    if row and "POLICY_LOCK" not in row["sql"]:
+    # 每引入新事件类型/新列都需要重建一次（历史与版本号完整保留、继续递增）
+    if row and (
+        "APPLICATION_SUBMITTED" not in row["sql"]
+        or "batch_id" not in row["sql"]
+    ):
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
                 """CREATE TABLE events_new (
-                       id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                       ts          TEXT NOT NULL,
-                       type        TEXT NOT NULL
-                                   CHECK (type IN ('TICKET_ISSUED','TICKET_REDEEMED',
-                                                   'TICKET_REVOKED','TICKET_EXPIRED',
-                                                   'POLICY_LOCK','POLICY_UNLOCK')),
-                       ticket_code TEXT,
-                       person_id   TEXT,
-                       gate_id     TEXT,
-                       reason      TEXT,
-                       payload     TEXT NOT NULL
+                       id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts             TEXT NOT NULL,
+                       type           TEXT NOT NULL
+                                        CHECK (type IN (
+                                          'TICKET_ISSUED','TICKET_REDEEMED',
+                                          'TICKET_REVOKED','TICKET_EXPIRED',
+                                          'POLICY_LOCK','POLICY_UNLOCK',
+                                          'BATCH_CREATED','BATCH_CLOSED','BATCH_CAPACITY_CHANGED',
+                                          'APPLICATION_SUBMITTED','APPLICATION_PROMOTED',
+                                          'APPLICATION_APPROVED','APPLICATION_CANCELLED',
+                                          'APPLICATION_REJECTED','APPLICATION_EXPIRED')),
+                       ticket_code    TEXT,
+                       person_id      TEXT,
+                       gate_id        TEXT,
+                       reason         TEXT,
+                       payload        TEXT NOT NULL,
+                       batch_id       TEXT,
+                       application_id TEXT
                    )"""
             )
             conn.execute(
                 """INSERT INTO events_new
-                       (id,ts,type,ticket_code,person_id,gate_id,reason,payload)
-                   SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload
+                       (id,ts,type,ticket_code,person_id,gate_id,reason,payload,
+                        batch_id,application_id)
+                   SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload,
+                          NULL,NULL
                      FROM events"""
             )
             conn.execute("DROP TABLE events")
@@ -215,15 +324,32 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_batch ON events(batch_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_app ON events(application_id)"
+            )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
+    # 新列对应的索引（IF NOT EXISTS，新旧库都安全；必须在补列/重建表之后执行）
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tickets_batch ON tickets(batch_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_batch ON events(batch_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_app ON events(application_id)"
+    )
+
 
 @contextmanager
 def write_tx(conn: sqlite3.Connection) -> Iterator[None]:
-    """立即获取写锁的事务，把并发核销在数据库层串行化。"""
+    """立即获取写锁的事务，把并发核销/申请在数据库层串行化。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -243,11 +369,14 @@ def add_event(
     gate_id: Optional[str] = None,
     reason: Optional[str] = None,
     payload: Optional[dict] = None,
+    batch_id: Optional[str] = None,
+    application_id: Optional[str] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO events
-               (ts, type, ticket_code, person_id, gate_id, reason, payload)
-           VALUES (?,?,?,?,?,?,?)""",
+               (ts, type, ticket_code, person_id, gate_id, reason, payload,
+                batch_id, application_id)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         (
             ts,
             event_type,
@@ -256,6 +385,8 @@ def add_event(
             gate_id,
             reason,
             json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+            batch_id,
+            application_id,
         ),
     )
     return int(cur.lastrowid)
