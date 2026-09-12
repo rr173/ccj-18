@@ -117,3 +117,13 @@ pre.log {
 .queue-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
 .queue-dot.on { background:#22c55e; }
 .queue-dot.off { background:#f59e0b; }
+
+.zone-box { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.zone-box label {
+  display: inline-flex; align-items: center; gap: 5px; margin: 0;
+  background: #0f172a; border: 1px solid #475569; border-radius: 999px;
+  padding: 5px 12px; font-size: 12px; color: #cbd5e1; cursor: pointer;
+}
+.zone-box input[type="checkbox"] { width: auto; margin: 0; }
+.badge.LOCKED { background: #7f1d1d; color: #fecaca; }
+.badge.OPEN { background: #14532d; color: #bbf7d0; }

@@ -1,4 +1,4 @@
-// 门点核销台：核销 + 失败重试队列 + 离线重连按版本补齐
+// 门点核销台：核销 + 失败重试队列 + 离线重连按版本补齐（含封锁策略事件）
 const $ = id => document.getElementById(id);
 
 const gateId = () => localStorage.getItem("shortpass_gate_id") || "";
@@ -6,9 +6,12 @@ const gateToken = () => localStorage.getItem("shortpass_gate_token") || "";
 const cursorKey = () => `shortpass_cursor_${gateId()}`;
 const queueKey = () => `shortpass_queue_${gateId()}`;
 const histKey = () => `shortpass_hist_${gateId()}`;
+const pvKey = () => `shortpass_pv_${gateId()}`;
 
 const getCursor = () => parseInt(localStorage.getItem(cursorKey()) || "0", 10);
 const setCursor = v => localStorage.setItem(cursorKey(), String(v));
+const getPV = () => parseInt(localStorage.getItem(pvKey()) || "0", 10);
+const setPV = v => { if (v > getPV()) localStorage.setItem(pvKey(), String(v)); };
 const getQueue = () => JSON.parse(localStorage.getItem(queueKey()) || "[]");
 const setQueue = q => localStorage.setItem(queueKey(), JSON.stringify(q));
 const getHist = () => JSON.parse(localStorage.getItem(histKey()) || "[]");
@@ -42,6 +45,7 @@ function setNet(on, text) {
 
 function renderBase() {
   $("cursor").textContent = "#" + getCursor();
+  $("pv").textContent = "#" + getPV();
   $("queue-n").textContent = getQueue().length;
   renderHistory();
 }
@@ -60,12 +64,15 @@ function showResult(r, httpStatus, replayed) {
   const ok = r.ok;
   const detail = r.reason_text || r.status;
   $("result").innerHTML = `<div class="result-box ${ok ? "ok" : "fail"}">
-    <div>${ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销"} ${httpStatus === 409 ? "（该票已使用）" : ""}</div>
+    <div>${ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销"} ${httpStatus === 409 && r.reason === "already_redeemed" ? "（该票已使用）" : ""}</div>
     <div class="big-code">${esc(r.code || "")}</div>
     <div class="detail">
       ${r.person_id ? "持票人 " + esc(r.person_id) + " · " : ""}状态 ${esc(r.status)} · ${esc(detail)}
       ${r.redeemed_gate ? "<br>已由门点 <b>" + esc(r.redeemed_gate) + "</b> 于 " + fmtTime(r.redeemed_at) + " 核销" : ""}
       ${r.revoked_reason ? "<br>作废原因：" + esc(r.revoked_reason) : ""}
+      ${r.reason === "zone_mismatch" ? "<br>本门点分区 <b>" + esc(r.zone_id || "") + "</b>，票据允许分区：" + esc((r.ticket_zones || []).join("、") || "（无）") : ""}
+      ${r.lock_rule ? "<br>封锁规则 <b>" + esc(r.lock_rule.rule_id) + "</b>（版本 #" + r.lock_rule.version + "）：" + esc(r.lock_rule.reason || "") : ""}
+      ${r.reason === "stale_policy" ? "<br>本门点策略版本 #" + r.policy_version + "，服务器已到 #" + r.current_policy_version + "，正在自动补齐…" : ""}
       ${replayed ? "<br>⚠ 本次为同一次扫码的幂等重放，结果以首次为准" : ""}
     </div>
   </div>`;
@@ -74,12 +81,13 @@ function showResult(r, httpStatus, replayed) {
 async function doRedeem(code, attemptId) {
   try {
     const r = await gateApi("POST", "/api/gate/redeem", {
-      gate_id: gateId(), code, attempt_id: attemptId,
+      gate_id: gateId(), code, attempt_id: attemptId, policy_version: getPV(),
     });
     return r; // fetch 非 2xx 会抛错
   } catch (e) {
-    // 4xx 是服务器的明确业务结论（已使用/已作废/已过期/不存在），同样是终态结果
-    if (e.data && (e.status === 409 || e.status === 410 || e.status === 403 || e.status === 404)) {
+    // 4xx 是服务器的明确业务结论（已使用/已作废/已过期/分区不符/封锁中等），同样是终态结果
+    if (e.data && (e.status === 409 || e.status === 410 || e.status === 403
+                   || e.status === 404 || e.status === 423)) {
       return e.data;
     }
     throw e; // 网络错误/5xx：留在队列稍后重试
@@ -105,10 +113,23 @@ async function flushQueue() {
   if (flushing || !gateId()) return;
   flushing = true;
   let queue = getQueue();
+  let staleRetries = 0;
   while (queue.length) {
     const item = queue[0]; // FIFO
     try {
       const r = await doRedeem(item.code, item.attempt_id);
+      if (r.reason === "stale_policy") {
+        // 规则版本过旧：不算终态结论，先按版本补齐策略事件再重试同一条
+        if (++staleRetries > 3) {
+          setNet(false, "策略版本过旧且同步失败，稍候自动重试");
+          break;
+        }
+        toast("封锁规则版本过旧，正在补齐后重试…", "info");
+        await sync();
+        continue; // 不移出队列，用同一 attempt_id 重试（服务端未记录该次判定）
+      }
+      staleRetries = 0;
+      if (r.policy_version) setPV(r.policy_version);
       const h = getHist();
       h.unshift({
         ts: r.ts || new Date().toISOString(),
@@ -133,7 +154,7 @@ async function flushQueue() {
   renderBase();
 }
 
-// 离线重连：按版本号顺序补齐撤销 / 核销 / 过期结果
+// 离线重连：按版本号顺序补齐撤销 / 核销 / 过期 / 封锁策略事件
 async function sync() {
   if (syncing || !gateId() || !gateToken()) return;
   syncing = true;
@@ -151,6 +172,7 @@ async function sync() {
           (e.gate_id ? ` @${e.gate_id}` : "") +
           (e.reason ? ` reason=${e.reason}` : ""));
         setCursor(e.version);
+        if (e.type === "POLICY_LOCK" || e.type === "POLICY_UNLOCK") setPV(e.version);
       }
       pages++;
       if (!data.events.length || !data.has_more || pages >= 50) break;

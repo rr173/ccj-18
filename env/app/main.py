@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -91,12 +92,29 @@ class GateIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
 
 
+class ZoneIn(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+
+
+class GateZoneIn(BaseModel):
+    zone_id: Optional[str] = None  # null = 清除分区（门点回到默认拒绝）
+
+
+class RuleIn(BaseModel):
+    rule_id: Optional[str] = Field(default=None, max_length=128)  # 留空自动生成
+    action: str = Field(min_length=1, max_length=16)  # LOCK / UNLOCK
+    zone_id: Optional[str] = None  # null = 全局规则
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
 class IssueIn(BaseModel):
     person_id: str = Field(min_length=1, max_length=128)
     valid_from: Optional[str] = None  # ISO8601，默认现在
     valid_until: Optional[str] = None
     ttl_seconds: Optional[int] = Field(default=None, ge=1, le=365 * 24 * 3600)
     note: Optional[str] = Field(default=None, max_length=500)
+    zones: Optional[list[str]] = None  # 允许通行的分区；缺省=[] 即所有门点拒绝
 
 
 class RevokeIn(BaseModel):
@@ -108,6 +126,7 @@ class RedeemIn(BaseModel):
     gate_id: str = Field(min_length=1, max_length=64)
     code: str = Field(min_length=1)
     attempt_id: str = Field(min_length=1, max_length=128)
+    policy_version: int = Field(default=0, ge=0)  # 门点已同步的封锁规则版本
 
 
 class SyncIn(BaseModel):
@@ -163,6 +182,87 @@ def admin_revoke_gate(gate_id: str, conn: sqlite3.Connection = Depends(get_conn)
     return {"id": gate_id, "revoked": True}
 
 
+# ---------------- 分区与封锁策略（管理端） ----------------
+
+@app.post("/api/admin/zones", dependencies=[Depends(require_admin)])
+def admin_create_zone(body: ZoneIn, conn: sqlite3.Connection = Depends(get_conn)):
+    if services.get_zone(conn, body.id) is not None:
+        raise HTTPException(status_code=409, detail=f"分区已存在: {body.id}")
+    zone = services.create_zone(conn, body.id, body.name)
+    conn.commit()
+    return zone
+
+
+@app.get("/api/admin/zones", dependencies=[Depends(require_admin)])
+def admin_list_zones(conn: sqlite3.Connection = Depends(get_conn)):
+    return {
+        "zones": services.list_zones(conn),
+        "policy_version": services.current_policy_version(conn),
+    }
+
+
+@app.get("/api/admin/zones/{zone_id}", dependencies=[Depends(require_admin)])
+def admin_zone_detail(zone_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = services.zone_detail(conn, zone_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="分区不存在")
+    return detail
+
+
+@app.delete("/api/admin/zones/{zone_id}", dependencies=[Depends(require_admin)])
+def admin_delete_zone(zone_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    if services.get_zone(conn, zone_id) is None:
+        raise HTTPException(status_code=404, detail="分区不存在")
+    services.delete_zone(conn, zone_id)
+    conn.commit()
+    return {
+        "id": zone_id,
+        "deleted": True,
+        "note": "仍引用该分区的门点将按“未知分区”默认拒绝",
+    }
+
+
+@app.put("/api/admin/gates/{gate_id}/zone", dependencies=[Depends(require_admin)])
+def admin_set_gate_zone(
+    gate_id: str, body: GateZoneIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    if services.get_gate(conn, gate_id) is None:
+        raise HTTPException(status_code=404, detail="门点不存在")
+    if body.zone_id is not None and services.get_zone(conn, body.zone_id) is None:
+        raise HTTPException(status_code=400, detail=f"未知分区: {body.zone_id}")
+    services.set_gate_zone(conn, gate_id, body.zone_id)
+    conn.commit()
+    return {"id": gate_id, "zone_id": body.zone_id}
+
+
+@app.post("/api/admin/policy/rules", dependencies=[Depends(require_admin)])
+def admin_publish_rule(body: RuleIn, conn: sqlite3.Connection = Depends(get_conn)):
+    rule_id = body.rule_id or f"R-{secrets.token_hex(6).upper()}"
+    result = services.publish_rule(
+        conn,
+        rule_id=rule_id,
+        action=body.action.strip().upper(),
+        zone_id=body.zone_id,
+        reason=body.reason,
+    )
+    if result["http_status"] == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
+    if result["http_status"] == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return JSONResponse(status_code=result["http_status"], content=result)
+
+
+@app.get("/api/admin/policy/rules", dependencies=[Depends(require_admin)])
+def admin_list_rules(
+    zone_id: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {
+        "rules": services.list_rules(conn, zone_id=zone_id),
+        "policy_version": services.current_policy_version(conn),
+    }
+
+
 @app.post("/api/admin/tickets", dependencies=[Depends(require_admin)])
 def admin_issue_ticket(body: IssueIn, conn: sqlite3.Connection = Depends(get_conn)):
     now = utcnow()
@@ -178,12 +278,22 @@ def admin_issue_ticket(body: IssueIn, conn: sqlite3.Connection = Depends(get_con
         raise HTTPException(status_code=400, detail=f"时间格式错误: {e}")
     if vu <= vf:
         raise HTTPException(status_code=400, detail="valid_until 必须晚于 valid_from")
+    zones: list[str] = []
+    for z in body.zones or []:
+        z = z.strip()
+        if not z:
+            continue
+        if services.get_zone(conn, z) is None:
+            raise HTTPException(status_code=400, detail=f"未知分区: {z}")
+        if z not in zones:
+            zones.append(z)
     ticket = services.issue_ticket(
         conn,
         person_id=body.person_id.strip(),
         valid_from=iso(vf),
         valid_until=iso(vu),
         note=body.note,
+        zones=zones,
     )
     return ticket
 
@@ -267,6 +377,7 @@ def gate_redeem(
         raw_code=body.code,
         gate_id=body.gate_id,
         attempt_id=body.attempt_id,
+        policy_version=body.policy_version,
     )
     return JSONResponse(status_code=result["http_status"], content=result["response"])
 
@@ -277,7 +388,7 @@ def gate_sync(
     gate=Depends(require_active_gate),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    """门点离线重连后按版本号补齐撤销/核销/过期结果。"""
+    """门点离线重连后按版本号补齐撤销/核销/过期与封锁策略事件。"""
     return services.get_events_since(
         conn, since_version=body.since_version, gate_id=body.gate_id
     )

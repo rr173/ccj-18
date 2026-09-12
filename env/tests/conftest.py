@@ -92,3 +92,9 @@ def register_gates(srv):
         for gid, name in [("g1", "一号门"), ("g2", "二号门"), ("g3", "三号门")]:
             r = c.post("/api/admin/gates", json={"id": gid, "name": name})
             assert r.status_code in (200, 409)
+        for zid, zname in [("Z1", "一区"), ("Z2", "二区")]:
+            r = c.post("/api/admin/zones", json={"id": zid, "name": zname})
+            assert r.status_code in (200, 409)
+        for gid in ("g1", "g2", "g3"):
+            r = c.put(f"/api/admin/gates/{gid}/zone", json={"zone_id": "Z1"})
+            assert r.status_code == 200

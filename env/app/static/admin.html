@@ -42,6 +42,8 @@
         </div>
         <label>备注</label>
         <input id="f-note" placeholder="可选">
+        <label>允许通行的分区（不勾选 = 所有门点拒绝）</label>
+        <div id="f-zones" class="zone-box"><span class="muted">加载中…</span></div>
         <button class="btn primary" id="btn-issue" style="margin-top:12px;width:100%">发票</button>
         <div id="issue-result"></div>
       </div>
@@ -64,6 +66,31 @@
         <button class="btn primary" id="btn-gate" style="margin-top:10px;width:100%">注册门点</button>
         <div class="section" id="gates"></div>
       </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>分区与紧急封锁</h2>
+        <div class="row">
+          <input id="z-id" placeholder="分区 ID，如 Z-A">
+          <input id="z-name" placeholder="名称，如 A 区">
+        </div>
+        <button class="btn primary" id="btn-zone" style="margin-top:10px;width:100%">创建分区</button>
+        <div class="section" id="zones"></div>
+
+        <h2 style="margin-top:18px">发布封锁规则（带版本号）</h2>
+        <div class="row">
+          <select id="pr-action">
+            <option value="LOCK">紧急封锁</option>
+            <option value="UNLOCK">解除封锁</option>
+          </select>
+          <select id="pr-zone"><option value="">全局（所有分区）</option></select>
+        </div>
+        <label>规则 ID（留空自动生成；重复发布同一 ID 不重复生效）</label>
+        <input id="pr-rule" class="mono" placeholder="例如 LOCK-20260912-01">
+        <label>原因</label>
+        <input id="pr-reason" placeholder="例如 消防演练 / 安保事件">
+        <button class="btn danger" id="btn-publish" style="margin-top:10px;width:100%">发布规则</button>
+        <div class="section" id="rules"></div>
+      </div>
     </div>
 
     <!-- 右栏：查询 -->
@@ -72,6 +99,7 @@
         <div class="tabs">
           <button data-tab="person" class="btn active">按人查看</button>
           <button data-tab="ticket" class="btn">按票查看</button>
+          <button data-tab="zone" class="btn">按分区查看</button>
           <button data-tab="events" class="btn">状态流水</button>
           <button data-tab="attempts" class="btn">门点记录</button>
         </div>
@@ -92,6 +120,14 @@
             <button class="btn primary" id="btn-ticket">查询</button>
           </div>
           <div class="section" id="t-detail"></div>
+        </div>
+
+        <div id="tab-zone" hidden>
+          <div class="row">
+            <select id="zv-zone"></select>
+            <button class="btn primary" id="btn-zoneview">查看分区</button>
+          </div>
+          <div class="section" id="zv-detail"></div>
         </div>
 
         <div id="tab-events" hidden>

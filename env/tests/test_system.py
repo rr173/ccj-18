@@ -10,9 +10,9 @@ import pytest
 ADMIN = None  # 占位，实际通过 srv.client() 拿
 
 
-def issue(srv, person, ttl=600, client=None, note=None):
+def issue(srv, person, ttl=600, client=None, note=None, zones=("Z1",)):
     c = client or srv.client()
-    payload = {"person_id": person, "ttl_seconds": ttl}
+    payload = {"person_id": person, "ttl_seconds": ttl, "zones": list(zones)}
     if note:
         payload["note"] = note
     r = c.post("/api/admin/tickets", json=payload)
@@ -24,10 +24,11 @@ def gate_client(srv):
     return srv.client(token=srv.gate_token)
 
 
-def redeem(srv, code, gate, attempt=None, client=None):
+def redeem(srv, code, gate, attempt=None, client=None, pv=0):
     c = client or gate_client(srv)
     return c.post("/api/gate/redeem", json={
         "gate_id": gate, "code": code, "attempt_id": attempt or str(uuid.uuid4()),
+        "policy_version": pv,
     })
 
 
@@ -237,6 +238,8 @@ def test_gate_registration_and_disable(srv):
 
     with srv.client() as admin:
         r = admin.post("/api/admin/gates", json={"id": "g-temp", "name": "临时门"})
+        assert r.status_code == 200
+        r = admin.put("/api/admin/gates/g-temp/zone", json={"zone_id": "Z1"})
         assert r.status_code == 200
         t = issue(srv, "P-009")
         assert gate_client(srv).post("/api/gate/redeem", json={

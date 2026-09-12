@@ -11,6 +11,12 @@
    (``WHERE status='ACTIVE'``)，并发扫同一张票时只有一个门点成功。
 5. ``scan_attempts`` 对 (gate_id, attempt_id) 建唯一约束，门点网络抖动
    重发同一次扫码时按幂等处理，返回第一次的核销结果。
+6. ``zones`` 是分区注册表；``gates.zone_id`` 指定门点所属分区，
+   ``tickets.zones`` (JSON 数组) 指定票允许通行的分区。
+7. ``policy_rules`` 是封锁/解除封锁规则表，``rule_id`` 主键去重
+   （重复发布同一规则不重复生效）；每次发布同时写一条
+   ``POLICY_LOCK`` / ``POLICY_UNLOCK`` 事件，版本号即 ``events.id``，
+   门点离线重连后与票据事件一起按版本补齐。
 """
 
 from __future__ import annotations
@@ -30,14 +36,24 @@ EVENT_TYPES = (
     "TICKET_REDEEMED",
     "TICKET_REVOKED",
     "TICKET_EXPIRED",
+    "POLICY_LOCK",
+    "POLICY_UNLOCK",
 )
+RULE_ACTIONS = ("LOCK", "UNLOCK")
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS zones (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gates (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    revoked    INTEGER NOT NULL DEFAULT 0
+    revoked    INTEGER NOT NULL DEFAULT 0,
+    zone_id    TEXT               -- NULL = 未配置分区策略，核销默认拒绝
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
@@ -53,7 +69,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     revoked_at     TEXT,
     revoked_reason TEXT,
     expired_at     TEXT,
-    note           TEXT
+    note           TEXT,
+    zones          TEXT NOT NULL DEFAULT '[]'  -- JSON 数组：允许通行的分区
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_person ON tickets(person_id);
 
@@ -63,7 +80,8 @@ CREATE TABLE IF NOT EXISTS events (
     ts          TEXT NOT NULL,
     type        TEXT NOT NULL
                 CHECK (type IN ('TICKET_ISSUED','TICKET_REDEEMED',
-                                'TICKET_REVOKED','TICKET_EXPIRED')),
+                                'TICKET_REVOKED','TICKET_EXPIRED',
+                                'POLICY_LOCK','POLICY_UNLOCK')),
     ticket_code TEXT,
     person_id   TEXT,
     gate_id     TEXT,
@@ -72,6 +90,17 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
+
+-- 封锁/解除封锁规则：rule_id 幂等去重；version 对应该规则的事件版本
+CREATE TABLE IF NOT EXISTS policy_rules (
+    rule_id    TEXT PRIMARY KEY,
+    action     TEXT NOT NULL CHECK (action IN ('LOCK','UNLOCK')),
+    zone_id    TEXT,                -- NULL = 全局规则，作用于所有分区
+    reason     TEXT,
+    created_at TEXT NOT NULL,
+    version    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rules_zone ON policy_rules(zone_id);
 
 -- 门点每次扫码尝试（含失败），用于幂等重放与门点记录
 CREATE TABLE IF NOT EXISTS scan_attempts (
@@ -136,8 +165,60 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库就地升级：补列 + 重建 events 表以扩展事件类型 CHECK。"""
+    gate_cols = {r["name"] for r in conn.execute("PRAGMA table_info(gates)")}
+    if "zone_id" not in gate_cols:
+        conn.execute("ALTER TABLE gates ADD COLUMN zone_id TEXT")
+    ticket_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tickets)")}
+    if "zones" not in ticket_cols:
+        conn.execute(
+            "ALTER TABLE tickets ADD COLUMN zones TEXT NOT NULL DEFAULT '[]'"
+        )
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    if row and "POLICY_LOCK" not in row["sql"]:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """CREATE TABLE events_new (
+                       id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts          TEXT NOT NULL,
+                       type        TEXT NOT NULL
+                                   CHECK (type IN ('TICKET_ISSUED','TICKET_REDEEMED',
+                                                   'TICKET_REVOKED','TICKET_EXPIRED',
+                                                   'POLICY_LOCK','POLICY_UNLOCK')),
+                       ticket_code TEXT,
+                       person_id   TEXT,
+                       gate_id     TEXT,
+                       reason      TEXT,
+                       payload     TEXT NOT NULL
+                   )"""
+            )
+            conn.execute(
+                """INSERT INTO events_new
+                       (id,ts,type,ticket_code,person_id,gate_id,reason,payload)
+                   SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload
+                     FROM events"""
+            )
+            conn.execute("DROP TABLE events")
+            conn.execute("ALTER TABLE events_new RENAME TO events")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id)"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 @contextmanager
@@ -194,4 +275,8 @@ def ticket_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     for col in ("revoked",):
         d.pop(col, None)
+    try:
+        d["zones"] = json.loads(d.get("zones") or "[]")
+    except json.JSONDecodeError:
+        d["zones"] = []
     return d
