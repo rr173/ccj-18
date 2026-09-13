@@ -78,6 +78,21 @@ EVENT_TYPES = (
     "ROUTE_COMPLETED",
     "ROUTE_VIOLATED",
     "ROUTE_CONFLICT",
+    # 访客授权委托与临时代理核验
+    "DELEGATION_CREATED",
+    "DELEGATION_APPROVAL_RECORDED",
+    "DELEGATION_APPROVED",
+    "DELEGATION_REJECTED",
+    "DELEGATION_REVOKED",
+    "DELEGATION_EXPIRED",
+    "PROXY_CREDENTIAL_ISSUED",
+    "PROXY_CREDENTIAL_REVOKED",
+    "PROXY_CREDENTIAL_EXPIRED",
+    "PROXY_CREDENTIAL_EXHAUSTED",
+    "PROXY_VERIFICATION_ALLOWED",
+    "PROXY_VERIFICATION_DENIED",
+    "PROXY_CONFLICT",
+    "PROXY_CONFLICT_RESOLVED",
 )
 RULE_ACTIONS = ("LOCK", "UNLOCK")
 
@@ -149,6 +164,25 @@ CONFLICT_KINDS = (
 # 冲突处理动作
 CONFLICT_RESOLUTIONS = ("DISMISSED", "APPLIED", "MARK_VIOLATED")
 
+# ---------------- 访客授权委托与临时代理核验 ----------------
+#
+# delegation 是管理员创建的授权委托。高风险委托需要两名不同管理员同时批准；
+# 普通委托一名管理员批准即可。批准后生成临时代理凭证，凭证在门点同时核验
+# 原持票人、代理人、时间与分区。所有创建/审批/撤销/过期/核验/冲突都进入
+# append-only events 版本流，门点离线重连后按版本补齐。
+DELEGATION_STATUSES = ("PENDING", "APPROVED", "REJECTED", "REVOKED", "EXPIRED")
+PROXY_CREDENTIAL_STATUSES = ("ACTIVE", "REVOKED", "EXPIRED", "EXHAUSTED")
+PROXY_CONFLICT_KINDS = (
+    "REVOKED_HISTORICAL",
+    "EXPIRED_HISTORICAL",
+    "EXHAUSTED_HISTORICAL",
+    "FUTURE_TIMESTAMP",
+    "INVALID_TIMESTAMP",
+    "AMBIGUOUS_OFFLINE_ORDER",
+    "BAD_HISTORICAL_CONTEXT",
+)
+PROXY_CONFLICT_RESOLUTIONS = ("DISMISSED", "APPLIED")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS zones (
     id         TEXT PRIMARY KEY,
@@ -210,7 +244,13 @@ CREATE TABLE IF NOT EXISTS events (
                        'ROUTE_RESUMED','ROUTE_BOUND',
                        'ROUTE_CHECKPOINT_CLOSED','ROUTE_CHECKPOINT_OPENED',
                        'ROUTE_STARTED','ROUTE_CHECKPOINT','ROUTE_COMPLETED',
-                       'ROUTE_VIOLATED','ROUTE_CONFLICT')),
+                       'ROUTE_VIOLATED','ROUTE_CONFLICT',
+                       'DELEGATION_CREATED','DELEGATION_APPROVAL_RECORDED','DELEGATION_APPROVED',
+                       'DELEGATION_REJECTED','DELEGATION_REVOKED','DELEGATION_EXPIRED',
+                       'PROXY_CREDENTIAL_ISSUED','PROXY_CREDENTIAL_REVOKED',
+                       'PROXY_CREDENTIAL_EXPIRED','PROXY_CREDENTIAL_EXHAUSTED',
+                       'PROXY_VERIFICATION_ALLOWED','PROXY_VERIFICATION_DENIED',
+                       'PROXY_CONFLICT','PROXY_CONFLICT_RESOLVED')),
     ticket_code    TEXT,
     person_id      TEXT,
     gate_id        TEXT,
@@ -222,7 +262,11 @@ CREATE TABLE IF NOT EXISTS events (
     route_id       TEXT,              -- 路线事件：路线族 ID
     route_version  INTEGER,           -- 路线事件：当时路线版本号
     checkpoint_seq INTEGER,           -- 检查点事件：检查点顺序（1 起）
-    progress_id    TEXT               -- 路线执行事件：route_progress.id
+    progress_id    TEXT,              -- 路线执行事件：route_progress.id
+    delegation_id  TEXT,              -- 授权委托事件：delegations.id
+    proxy_credential_code TEXT,       -- 临时代理凭证事件：proxy_credentials.code
+    proxy_verification_id INTEGER,    -- 代理核验事件：proxy_verifications.id
+    proxy_conflict_id INTEGER         -- 离线代理核验冲突：proxy_conflicts.id
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
@@ -613,6 +657,155 @@ CREATE TABLE IF NOT EXISTS route_event_conflicts (
 CREATE INDEX IF NOT EXISTS idx_conf_status ON route_event_conflicts(status);
 CREATE INDEX IF NOT EXISTS idx_conf_code ON route_event_conflicts(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_conf_route ON route_event_conflicts(route_id);
+
+-- ---------------- 访客授权委托与临时代理核验 ----------------
+
+CREATE TABLE IF NOT EXISTS delegations (
+    id             TEXT PRIMARY KEY,          -- D-XXXXXXXX
+    status         TEXT NOT NULL
+                   CHECK (status IN ('PENDING','APPROVED','REJECTED','REVOKED','EXPIRED')),
+    high_risk      INTEGER NOT NULL DEFAULT 0,
+    original_person_id TEXT NOT NULL,
+    proxy_person_id TEXT NOT NULL,
+    valid_from     TEXT NOT NULL,
+    valid_until    TEXT NOT NULL,
+    zones_json     TEXT NOT NULL DEFAULT '[]',
+    max_uses       INTEGER NOT NULL CHECK (max_uses > 0),
+    purpose        TEXT NOT NULL,
+    ticket_code    TEXT,                      -- 可选：要求原持票人同时持有的短时票
+    required_approvers INTEGER NOT NULL CHECK (required_approvers IN (1,2)),
+    approvers_json TEXT NOT NULL DEFAULT '[]',
+    created_at     TEXT NOT NULL,
+    created_by     TEXT NOT NULL,
+    request_id     TEXT UNIQUE,
+    decided_at     TEXT,
+    decided_reason TEXT,
+    revoked_at     TEXT,
+    revoked_by     TEXT,
+    revoked_reason TEXT,
+    expired_at     TEXT,
+    approved_version INTEGER,
+    credential_code TEXT,
+    CHECK (original_person_id <> proxy_person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_delegations_original ON delegations(original_person_id);
+CREATE INDEX IF NOT EXISTS idx_delegations_proxy ON delegations(proxy_person_id);
+CREATE INDEX IF NOT EXISTS idx_delegations_status ON delegations(status);
+CREATE INDEX IF NOT EXISTS idx_delegations_valid ON delegations(valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_delegations_credential ON delegations(credential_code);
+
+CREATE TABLE IF NOT EXISTS delegation_approvals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    delegation_id  TEXT NOT NULL,
+    approver_id    TEXT NOT NULL,
+    action         TEXT NOT NULL CHECK (action IN ('APPROVE','REJECT')),
+    at             TEXT NOT NULL,
+    reason         TEXT,
+    event_version  INTEGER NOT NULL,
+    UNIQUE (delegation_id, approver_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dapprovals_delegation ON delegation_approvals(delegation_id);
+
+CREATE TABLE IF NOT EXISTS proxy_credentials (
+    code           TEXT PRIMARY KEY,          -- P-XXXXXXXX
+    delegation_id  TEXT NOT NULL UNIQUE,
+    status         TEXT NOT NULL
+                   CHECK (status IN ('ACTIVE','REVOKED','EXPIRED','EXHAUSTED')),
+    original_person_id TEXT NOT NULL,
+    proxy_person_id TEXT NOT NULL,
+    valid_from     TEXT NOT NULL,
+    valid_until    TEXT NOT NULL,
+    zones_json     TEXT NOT NULL DEFAULT '[]',
+    max_uses       INTEGER NOT NULL CHECK (max_uses > 0),
+    used_count     INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    purpose        TEXT NOT NULL,
+    ticket_code    TEXT,
+    issued_at      TEXT NOT NULL,
+    issued_version INTEGER NOT NULL,
+    revoked_at     TEXT,
+    revoked_by     TEXT,
+    revoked_reason TEXT,
+    revoked_version INTEGER,
+    expired_at     TEXT,
+    expired_version INTEGER,
+    exhausted_at   TEXT,
+    exhausted_version INTEGER,
+    CHECK (used_count <= max_uses)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_original ON proxy_credentials(original_person_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_person ON proxy_credentials(proxy_person_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_status ON proxy_credentials(status);
+CREATE INDEX IF NOT EXISTS idx_proxy_valid ON proxy_credentials(valid_from, valid_until);
+
+-- 每次门点核验都追加：通过、拒绝、离线冲突的补处理均不覆盖首次记录。
+CREATE TABLE IF NOT EXISTS proxy_verifications (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id        TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    credential_code TEXT NOT NULL,
+    delegation_id  TEXT NOT NULL,
+    original_person_id TEXT,
+    proxy_person_id TEXT,
+    zone_id        TEXT,
+    event_ts       TEXT NOT NULL,              -- 门点现场事件时间
+    processed_at   TEXT NOT NULL,              -- 服务器处理时间
+    offline        INTEGER NOT NULL DEFAULT 0,
+    decision       TEXT NOT NULL CHECK (decision IN ('ALLOWED','DENIED','CONFLICT')),
+    reason         TEXT NOT NULL,
+    http_status    INTEGER NOT NULL,
+    usage_before   INTEGER,
+    usage_after    INTEGER,
+    event_version  INTEGER,
+    conflict_id    INTEGER,
+    result_json    TEXT NOT NULL,
+    UNIQUE (gate_id, attempt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pverify_credential ON proxy_verifications(credential_code);
+CREATE INDEX IF NOT EXISTS idx_pverify_original ON proxy_verifications(original_person_id);
+CREATE INDEX IF NOT EXISTS idx_pverify_proxy ON proxy_verifications(proxy_person_id);
+CREATE INDEX IF NOT EXISTS idx_pverify_event_ts ON proxy_verifications(event_ts);
+CREATE INDEX IF NOT EXISTS idx_pverify_decision ON proxy_verifications(decision);
+
+CREATE TABLE IF NOT EXISTS proxy_conflicts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id        TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    credential_code TEXT NOT NULL,
+    delegation_id  TEXT,
+    original_person_id TEXT,
+    proxy_person_id TEXT,
+    zone_id        TEXT,
+    kind           TEXT NOT NULL
+                   CHECK (kind IN ('REVOKED_HISTORICAL','EXPIRED_HISTORICAL',
+                                   'EXHAUSTED_HISTORICAL','FUTURE_TIMESTAMP',
+                                   'INVALID_TIMESTAMP','AMBIGUOUS_OFFLINE_ORDER',
+                                   'BAD_HISTORICAL_CONTEXT')),
+    event_ts       TEXT,
+    detected_at    TEXT NOT NULL,
+    detail_json    TEXT NOT NULL DEFAULT '{}',
+    status         TEXT NOT NULL DEFAULT 'OPEN'
+                   CHECK (status IN ('OPEN','RESOLVED')),
+    resolution     TEXT CHECK (resolution IS NULL OR resolution IN ('DISMISSED','APPLIED')),
+    resolved_at    TEXT,
+    resolved_by    TEXT,
+    resolve_reason TEXT,
+    verification_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pconf_status ON proxy_conflicts(status);
+CREATE INDEX IF NOT EXISTS idx_pconf_credential ON proxy_conflicts(credential_code);
+CREATE INDEX IF NOT EXISTS idx_pconf_original ON proxy_conflicts(original_person_id);
+CREATE INDEX IF NOT EXISTS idx_pconf_proxy ON proxy_conflicts(proxy_person_id);
+
+CREATE TABLE IF NOT EXISTS proxy_revocations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    delegation_id  TEXT NOT NULL,
+    credential_code TEXT,
+    revoked_at     TEXT NOT NULL,
+    revoked_by     TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    event_version  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prevoke_delegation ON proxy_revocations(delegation_id);
 """
 
 
@@ -756,6 +949,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE applications ADD COLUMN companion_names TEXT NOT NULL DEFAULT '[]'"
         )
 
+    # 授权委托模块：老库逐列补齐（新库由 CREATE TABLE 直接创建）。
+    def _columns(table: str) -> set[str]:
+        return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    existing_tables = {
+        r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "delegations" in existing_tables:
+        delegation_cols = _columns("delegations")
+        if "request_id" not in delegation_cols:
+            conn.execute("ALTER TABLE delegations ADD COLUMN request_id TEXT UNIQUE")
+        if "approvers_json" not in delegation_cols:
+            conn.execute(
+                "ALTER TABLE delegations ADD COLUMN approvers_json TEXT NOT NULL DEFAULT '[]'"
+            )
+    if "proxy_credentials" in existing_tables:
+        credential_cols = _columns("proxy_credentials")
+        for col, ddl in (
+            ("revoked_version", "INTEGER"),
+            ("expired_version", "INTEGER"),
+            ("exhausted_version", "INTEGER"),
+        ):
+            if col not in credential_cols:
+                conn.execute(
+                    f"ALTER TABLE proxy_credentials ADD COLUMN {col} {ddl}"
+                )
+
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
     ).fetchone()
@@ -765,9 +987,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         or "APPLICATION_CHANGE_SUBMITTED" not in row["sql"]
         or "PRESENCE_ARRIVED" not in row["sql"]
         or "ROUTE_STARTED" not in row["sql"]
-        or "batch_id" not in row["sql"]
-        or "rollcall_id" not in row["sql"]
-        or "route_id" not in row["sql"]
+        or "PROXY_CREDENTIAL_ISSUED" not in row["sql"]
+        or "delegation_id" not in row["sql"]
+        or "proxy_credential_code" not in row["sql"]
     ):
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -793,7 +1015,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                                           'ROUTE_PAUSED','ROUTE_RESUMED','ROUTE_BOUND',
                                           'ROUTE_CHECKPOINT_CLOSED','ROUTE_CHECKPOINT_OPENED',
                                           'ROUTE_STARTED','ROUTE_CHECKPOINT','ROUTE_COMPLETED',
-                                          'ROUTE_VIOLATED','ROUTE_CONFLICT')),
+                                          'ROUTE_VIOLATED','ROUTE_CONFLICT',
+                                          'DELEGATION_CREATED','DELEGATION_APPROVAL_RECORDED','DELEGATION_APPROVED',
+                                          'DELEGATION_REJECTED','DELEGATION_REVOKED','DELEGATION_EXPIRED',
+                                          'PROXY_CREDENTIAL_ISSUED','PROXY_CREDENTIAL_REVOKED',
+                                          'PROXY_CREDENTIAL_EXPIRED','PROXY_CREDENTIAL_EXHAUSTED',
+                                          'PROXY_VERIFICATION_ALLOWED','PROXY_VERIFICATION_DENIED',
+                                          'PROXY_CONFLICT','PROXY_CONFLICT_RESOLVED')),
                        ticket_code    TEXT,
                        person_id      TEXT,
                        gate_id        TEXT,
@@ -805,7 +1033,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
                        route_id       TEXT,
                        route_version  INTEGER,
                        checkpoint_seq INTEGER,
-                       progress_id    TEXT
+                       progress_id    TEXT,
+                       delegation_id  TEXT,
+                       proxy_credential_code TEXT,
+                       proxy_verification_id INTEGER,
+                       proxy_conflict_id INTEGER
                    )"""
             )
             # 老库可能还没有部分列（逐版补齐，列不存在先补 NULL）
@@ -820,10 +1052,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 f"""INSERT INTO events_new
                        (id,ts,type,ticket_code,person_id,gate_id,reason,payload,
                         batch_id,application_id,rollcall_id,
-                        route_id,route_version,checkpoint_seq,progress_id)
+                        route_id,route_version,checkpoint_seq,progress_id,
+                        delegation_id,proxy_credential_code,proxy_verification_id,
+                        proxy_conflict_id)
                    SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload,
                           {select_batch},{select_app},{select_rc},
-                          {select_rid},{select_rver},{select_cseq},NULL
+                          {select_rid},{select_rver},{select_cseq},NULL,
+                          NULL,NULL,NULL,NULL
                      FROM events"""
             )
             conn.execute("DROP TABLE events")
@@ -866,6 +1101,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_delegation ON events(delegation_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_proxy_credential ON events(proxy_credential_code)"
+    )
 
 
 @contextmanager
@@ -897,13 +1138,19 @@ def add_event(
     route_version: Optional[int] = None,
     checkpoint_seq: Optional[int] = None,
     progress_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    proxy_credential_code: Optional[str] = None,
+    proxy_verification_id: Optional[int] = None,
+    proxy_conflict_id: Optional[int] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO events
                (ts, type, ticket_code, person_id, gate_id, reason, payload,
                 batch_id, application_id, rollcall_id,
-                route_id, route_version, checkpoint_seq, progress_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                route_id, route_version, checkpoint_seq, progress_id,
+                delegation_id, proxy_credential_code, proxy_verification_id,
+                proxy_conflict_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             ts,
             event_type,
@@ -919,6 +1166,10 @@ def add_event(
             route_version,
             checkpoint_seq,
             progress_id,
+            delegation_id,
+            proxy_credential_code,
+            proxy_verification_id,
+            proxy_conflict_id,
         ),
     )
     return int(cur.lastrowid)

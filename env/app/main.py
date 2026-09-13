@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from . import services
 from . import presence as presence_svc
 from . import routes as routes_svc
+from . import delegations as delegation_svc
 from .db import DB_PATH, connect, init_db, iso, parse_dt, utcnow
 from .services import SWEEP_INTERVAL
 
@@ -278,6 +279,64 @@ class CheckpointReplayIn(BaseModel):
 
 class ConflictResolveIn(BaseModel):
     action: str = Field(pattern="^(DISMISSED|APPLIED|MARK_VIOLATED)$")
+    reason: Optional[str] = Field(default=None, max_length=300)
+    operator: Optional[str] = Field(default=None, max_length=128)
+
+
+# ---------------- 访客授权委托与临时代理核验模型 ----------------
+
+class DelegationIn(BaseModel):
+    original_person_id: str = Field(min_length=1, max_length=128)
+    proxy_person_id: str = Field(min_length=1, max_length=128)
+    valid_from: str = Field(min_length=5)
+    valid_until: str = Field(min_length=5)
+    zones: list[str] = Field(min_length=1, max_length=50)
+    max_uses: int = Field(ge=1, le=10000)
+    purpose: str = Field(min_length=1, max_length=500)
+    high_risk: bool = False
+    ticket_code: Optional[str] = Field(default=None, max_length=64)
+    approvers: Optional[list[str]] = None
+    operator: Optional[str] = Field(default=None, max_length=128)
+    request_id: Optional[str] = Field(default=None, min_length=8, max_length=128)
+
+
+class DelegationDecisionIn(BaseModel):
+    approver_id: str = Field(min_length=1, max_length=128)
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class DelegationRevokeIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=300)
+    operator: Optional[str] = Field(default=None, max_length=128)
+
+
+class ProxyVerifyIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1, max_length=128)
+    original_person_id: str = Field(min_length=1, max_length=128)
+    proxy_person_id: str = Field(min_length=1, max_length=128)
+    original_ticket_code: Optional[str] = Field(default=None, max_length=64)
+    event_ts: Optional[str] = None
+
+
+class OfflineProxyEvent(BaseModel):
+    code: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1, max_length=128)
+    original_person_id: Optional[str] = Field(default=None, max_length=128)
+    proxy_person_id: Optional[str] = Field(default=None, max_length=128)
+    original_ticket_code: Optional[str] = Field(default=None, max_length=64)
+    event_ts: Optional[str] = None
+
+
+class ProxyReplayIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    base_version: Optional[int] = Field(default=None, ge=0)
+    events: list[OfflineProxyEvent] = Field(min_length=1, max_length=1000)
+
+
+class ProxyConflictResolveIn(BaseModel):
+    action: str = Field(pattern="^(DISMISSED|APPLIED)$")
     reason: Optional[str] = Field(default=None, max_length=300)
     operator: Optional[str] = Field(default=None, max_length=128)
 
@@ -1051,6 +1110,211 @@ def admin_resolve_route_conflict(
     return result
 
 
+# ---------------- 访客授权委托与临时代理核验（管理端） ----------------
+
+def _delegation_operator(body=None) -> str:
+    val = getattr(body, "operator", None) if body is not None else None
+    return val.strip() if val and val.strip() else "admin"
+
+
+@app.post("/api/admin/delegations", dependencies=[Depends(require_admin)])
+def admin_create_delegation(
+    body: DelegationIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    """创建带时间、分区、次数和用途的授权委托；高风险需两名不同管理员。"""
+    result = delegation_svc.create_delegation(
+        conn,
+        original_person_id=body.original_person_id,
+        proxy_person_id=body.proxy_person_id,
+        valid_from=body.valid_from,
+        valid_until=body.valid_until,
+        zones=[z.strip() for z in body.zones if z.strip()],
+        max_uses=body.max_uses,
+        purpose=body.purpose,
+        high_risk=body.high_risk,
+        ticket_code=services.normalize_code(body.ticket_code)
+        if body.ticket_code else None,
+        approvers=body.approvers,
+        operator=f"admin:{_delegation_operator(body)}",
+        request_id=body.request_id,
+    )
+    status = result.pop("http_status", 201)
+    if status in (400, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.get("/api/admin/delegations", dependencies=[Depends(require_admin)])
+def admin_list_delegations(
+    original_person_id: Optional[str] = Query(default=None),
+    proxy_person_id: Optional[str] = Query(default=None),
+    zone_id: Optional[str] = Query(default=None),
+    status_filter: str = Query(default="", alias="status"),
+    valid_from: Optional[str] = Query(default=None),
+    valid_to: Optional[str] = Query(default=None),
+    active_from: Optional[str] = Query(default=None),
+    active_to: Optional[str] = Query(default=None),
+    active_at: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"delegations": delegation_svc.list_delegations(
+        conn,
+        original_person_id=original_person_id,
+        proxy_person_id=proxy_person_id,
+        zone_id=zone_id,
+        status=status_filter.strip().upper() or None,
+        start_from=valid_from,
+        start_to=valid_to,
+        active_from=active_from,
+        active_to=active_to,
+        active_at=active_at,
+    )}
+
+
+@app.get("/api/admin/delegations/{delegation_id}", dependencies=[Depends(require_admin)])
+def admin_delegation_detail(delegation_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = delegation_svc.delegation_detail(conn, delegation_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="授权委托不存在")
+    return detail
+
+
+@app.post("/api/admin/delegations/{delegation_id}/approvals",
+          dependencies=[Depends(require_admin)])
+def admin_delegation_decision(
+    delegation_id: str, body: DelegationDecisionIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """管理员批准/拒绝；高风险委托集齐两名不同管理员批准后才签发凭证。"""
+    result = delegation_svc.record_delegation_decision(
+        conn, delegation_id=delegation_id, approver_id=body.approver_id,
+        action="APPROVE", reason=body.reason)
+    status = result.pop("http_status", 200)
+    if status in (400, 403, 404, 409, 410):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.post("/api/admin/delegations/{delegation_id}/rejections",
+          dependencies=[Depends(require_admin)])
+def admin_reject_delegation(
+    delegation_id: str, body: DelegationDecisionIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    result = delegation_svc.record_delegation_decision(
+        conn, delegation_id=delegation_id, approver_id=body.approver_id,
+        action="REJECT", reason=body.reason)
+    status = result.pop("http_status", 200)
+    if status in (400, 403, 404, 409, 410):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
+@app.post("/api/admin/delegations/{delegation_id}/revoke",
+          dependencies=[Depends(require_admin)])
+def admin_revoke_delegation(
+    delegation_id: str, body: DelegationRevokeIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    result = delegation_svc.revoke_delegation(
+        conn, delegation_id=delegation_id, reason=body.reason,
+        operator=f"admin:{_delegation_operator(body)}")
+    status = result.pop("http_status", 200)
+    if status in (404, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
+@app.get("/api/admin/proxy-verifications", dependencies=[Depends(require_admin)])
+def admin_proxy_verifications(
+    original_person_id: Optional[str] = Query(default=None),
+    proxy_person_id: Optional[str] = Query(default=None),
+    zone_id: Optional[str] = Query(default=None),
+    credential_code: Optional[str] = Query(default=None),
+    delegation_id: Optional[str] = Query(default=None),
+    decision: Optional[str] = Query(default=None),
+    reason: Optional[str] = Query(default=None),
+    start_ts: Optional[str] = Query(default=None),
+    end_ts: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"verifications": delegation_svc.list_proxy_verifications(
+        conn,
+        original_person_id=original_person_id,
+        proxy_person_id=proxy_person_id,
+        zone_id=zone_id,
+        credential_code=credential_code,
+        delegation_id=delegation_id,
+        decision=decision,
+        reason=reason,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )}
+
+
+@app.get("/api/admin/proxy-conflicts", dependencies=[Depends(require_admin)])
+def admin_proxy_conflicts(
+    status_filter: str = Query(default="OPEN", alias="status"),
+    original_person_id: Optional[str] = Query(default=None),
+    proxy_person_id: Optional[str] = Query(default=None),
+    zone_id: Optional[str] = Query(default=None),
+    credential_code: Optional[str] = Query(default=None),
+    delegation_id: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"conflicts": delegation_svc.list_proxy_conflicts(
+        conn,
+        status_filter=status_filter.upper(),
+        original_person_id=original_person_id,
+        proxy_person_id=proxy_person_id,
+        zone_id=zone_id,
+        credential_code=credential_code,
+        delegation_id=delegation_id,
+    )}
+
+
+@app.post("/api/admin/proxy-conflicts/{conflict_id}/resolve",
+          dependencies=[Depends(require_admin)])
+def admin_resolve_proxy_conflict(
+    conflict_id: int, body: ProxyConflictResolveIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    result = delegation_svc.resolve_proxy_conflict(
+        conn, conflict_id=conflict_id, action=body.action,
+        operator=f"admin:{_delegation_operator(body)}", reason=body.reason)
+    status = result.pop("http_status", 200)
+    if status in (400, 404, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
+@app.get("/api/admin/proxy-revocations", dependencies=[Depends(require_admin)])
+def admin_proxy_revocations(
+    original_person_id: Optional[str] = Query(default=None),
+    proxy_person_id: Optional[str] = Query(default=None),
+    delegation_id: Optional[str] = Query(default=None),
+    credential_code: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"revocations": delegation_svc.list_proxy_revocations(
+        conn,
+        original_person_id=original_person_id,
+        proxy_person_id=proxy_person_id,
+        delegation_id=delegation_id,
+        credential_code=credential_code,
+    )}
+
+
+@app.get("/api/admin/people/{person_id}/proxy", dependencies=[Depends(require_admin)])
+def admin_person_proxy_view(person_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    return delegation_svc.person_proxy_view(conn, person_id)
+
+
 # ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
 @app.get("/api/public/batches/{token}")
 def public_batch(token: str, conn: sqlite3.Connection = Depends(get_conn)):
@@ -1233,6 +1497,43 @@ def gate_checkpoint_replay(
     return result
 
 
+@app.post("/api/gate/proxy/verify", dependencies=[Depends(require_gate)])
+def gate_proxy_verify(
+    body: ProxyVerifyIn,
+    gate=Depends(require_active_gate),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """门点临时代理核验：原持票人、代理人、时间、分区任一不满足即明确拒绝。"""
+    result = delegation_svc.verify_proxy(
+        conn,
+        gate_id=body.gate_id,
+        code=body.code,
+        attempt_id=body.attempt_id,
+        original_person_id=body.original_person_id,
+        proxy_person_id=body.proxy_person_id,
+        original_ticket_code=body.original_ticket_code,
+        event_ts=body.event_ts,
+    )
+    return JSONResponse(status_code=result["http_status"], content=result["response"])
+
+
+@app.post("/api/gate/proxy/replay", dependencies=[Depends(require_gate)])
+def gate_proxy_replay(
+    body: ProxyReplayIn,
+    gate=Depends(require_active_gate),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """门点离线期间代理核验记录重连后按现场时间和版本补齐。"""
+    result = delegation_svc.replay_proxy_verifications(
+        conn,
+        gate_id=body.gate_id,
+        events=[e.model_dump() for e in body.events],
+        base_version=body.base_version,
+    )
+    conn.commit()
+    return result
+
+
 @app.get("/api/gate/heartbeat/{gate_id}", dependencies=[Depends(require_gate)])
 def gate_heartbeat(gate_id: str, conn: sqlite3.Connection = Depends(get_conn)):
     gate = services.get_gate(conn, gate_id)
@@ -1256,6 +1557,7 @@ def _sweeper_loop() -> None:
                     app.state.expired_apps_total = (
                         getattr(app.state, "expired_apps_total", 0) + len(expired_apps)
                     )
+                delegation_svc.sweep_expired(conn)
             except sqlite3.Error:
                 # 下一轮重试，绝不让清扫线程死掉
                 time.sleep(1)

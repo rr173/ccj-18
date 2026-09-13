@@ -16,7 +16,14 @@
   原始轨迹与操作者保留；应急清点生成**不可变快照**（在场人员、同行名单、批次分区、
   最后门点记录全部冻结，之后变化不改旧快照）；四类事件进同一版本流，门点离线重连
   按版本补齐。
-- `tests/` 含 87 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
+- **访客授权委托与临时代理核验**：管理员创建带生效区间、允许分区、最大次数、
+  用途说明的委托；高风险委托必须由两名不同指定管理员批准。批准后原子生成临时
+  代理凭证，门点同时核验原持票人、代理人、时间、分区，任一缺失或不匹配都明确
+  拒绝且不消耗次数。撤销、过期、审批、每次通过/拒绝与离线冲突都进入同一全局
+  版本事件流；`(gate_id, attempt_id)` 幂等防网络重发，`BEGIN IMMEDIATE` + 条件
+  更新保证多门点并发不会超扣。门点离线记录重连批量补齐，撤销/用尽前的迟到现场
+  事件不能自动复活凭证，进入冲突队列由管理员人工 DISMISSED/APPLIED。
+- `tests/` 含覆盖短时票、预约、在场、路线与授权委托的端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
 
 ## 需求对应的关键保证
 
@@ -100,6 +107,25 @@
 | 按分区、批次、人员、路线查询当前点/超时/完成/违规 | `GET /api/admin/route-progress?status=&zone_id=&batch_id=&person_id=&route_id=&overdue=`；`GET /api/admin/route-progress/{code}`（版本检查点定义+完整门点检查记录+冲突）；批次详情 `…/routes` 汇总；人员视图含 `routes`；`GET /api/admin/route-conflicts` |
 
 门点核销响应在路线票上额外携带 `route: {status,current_seq,next_seq,current_checkpoint,next_checkpoint,dwell_seconds,dwell_deadline,overdue,…}`；门点台新增「路线检查点」模式，离线时检查点事件进本地队列、重连后批量补齐（冲突在界面上提示等待管理员处理）。检查点裁决 HTTP 约定：通过/完成 200；重复进入/跳点/超时/终态后上报 409；进入已关闭点 423；门点不在路线/非入口开始 403；目录版本过旧 409 `stale_route`（唯一不落库、可重试的结论）。
+
+### 访客授权委托与临时代理核验
+
+| 需求 | 实现方式 |
+|---|---|
+| 管理员为人员创建带生效区间、分区、次数和用途的委托 | `POST /api/admin/delegations`；字段固化在 `delegations`，高风险委托必须提供两名不同审批管理员，普通委托任一管理员审批即可 |
+| 高风险委托两人审批 | `POST /api/admin/delegations/{id}/approvals` 按 `(delegation_id, approver_id)` 幂等；第一名指定管理员返回 202，第二名不同指定管理员批准后在同一事务把委托置 APPROVED 并签发凭证；未在名单中的管理员 403 |
+| 批准后生成代理凭证 | `PROXY_CREDENTIAL_ISSUED` 与委托 APPROVED 同事务写入；`proxy_credentials` 保存原持票人、代理人、生效区间、允许分区、最大次数、用途，委托与凭证一一对应 |
+| 门点同时核验原持票人、代理人、时间、分区 | `POST /api/gate/proxy/verify` 必须传原持票人和代理人；身份不匹配 403，未到时间/过期 403/410，分区不符 403，门点无策略/未知分区/封锁同样拒绝；缺少身份返回 400；所有明确拒绝均写 `proxy_verifications` 与版本事件 |
+| 代理凭证只能使用一次 / 最大次数不超扣 | 条件更新 `SET used_count=used_count+1 WHERE code=? AND used_count<max_uses` 在 `BEGIN IMMEDIATE` 内执行；达到上限同事务置 EXHAUSTED 并写事件，终态不回退 |
+| 网络重发不能重复消耗 | `proxy_verifications (gate_id, attempt_id)` 唯一；同一次物理上报重放返回首次报文并带 `replayed:true`，不再增加次数 |
+| 撤销 / 过期 / 审批变更 / 核验进入同一版本流 | 所有动作写全局 append-only `events`（`DELEGATION_*`、`PROXY_CREDENTIAL_*`、`PROXY_VERIFICATION_*`、`PROXY_CONFLICT*`）；门点仍通过 `/api/gate/sync` 按版本分页补齐 |
+| 离线核验重连按版本补齐 | `POST /api/gate/proxy/replay {base_version, events:[...]}`；事件按门点本地 `event_ts` 排序，在单写事务中逐条裁决；身份/分区/时间拒绝保留，可安全接受的历史使用补记次数 |
+| 已撤销或用尽凭证不能因旧事件恢复有效 | REVOKED/EXHAUSTED 状态不会被改回 ACTIVE；撤销前或用尽前的迟到离线事件不自动放行，落 `REVOKED_HISTORICAL`/`EXHAUSTED_HISTORICAL` 冲突；撤销后的迟到事件直接拒绝。管理员 APPLIED 只在仍有余量且现场满足条件时补记一条历史使用，凭证保持原终态 |
+| 撤销历史 | 撤销写 `proxy_revocations` + `DELEGATION_REVOKED`/`PROXY_CREDENTIAL_REVOKED`；已签发凭证同事务置 REVOKED |
+| 查询当前授权、次数、拒绝原因、审批、撤销和离线冲突 | `GET /api/admin/delegations` 支持原持票人/代理人/分区/状态/时间过滤；详情含 approvals、verifications、conflicts、revocations、events；另有 `/proxy-verifications`、`/proxy-conflicts`、`/proxy-revocations` 与 `/people/{id}/proxy` |
+| 无法自动裁决的冲突人工处理 | `POST /api/admin/proxy-conflicts/{id}/resolve` 支持 `DISMISSED`（确认忽略）和 `APPLIED`（核实后安全补记通过）；冲突记录追加处理结论，不删除、不覆盖原核验记录 |
+
+门点代理核验返回约定：通过 200；缺少原持票人/代理人 400；身份/分区/时间不符 403；封锁 423；凭证不存在 404；已撤销/过期/用尽 410；离线无法自动裁决 409 且返回 `conflict_id`。
 
 ### 核销响应约定（门点端可直接据此亮灯/播报）
 
@@ -242,12 +268,27 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 - `GET  /api/admin/route-conflicts?status=OPEN|RESOLVED|ALL&zone_id=&batch_id=&person_id=&route_id=`
 - `POST /api/admin/route-conflicts/{id}/resolve` `{action:"APPLIED"|"MARK_VIOLATED"|"DISMISSED", reason?, operator?}`
 
+访客授权委托与临时代理核验（管理端，Bearer 管理员令牌）
+
+- `POST /api/admin/delegations` `{original_person_id, proxy_person_id, valid_from, valid_until, zones, max_uses, purpose, high_risk?, approvers?, ticket_code?}`
+- `GET  /api/admin/delegations?original_person_id=&proxy_person_id=&zone_id=&status=&valid_from=&valid_to=&active_from=&active_to=&active_at=`
+- `GET  /api/admin/delegations/{id}`（凭证、剩余次数、审批、全部核验/拒绝、冲突、撤销与版本事件）
+- `POST /api/admin/delegations/{id}/approvals` / `rejections` `{approver_id, reason?}`
+- `POST /api/admin/delegations/{id}/revoke` `{reason, operator?}`
+- `GET  /api/admin/proxy-verifications?original_person_id=&proxy_person_id=&zone_id=&decision=&reason=&start_ts=&end_ts=`
+- `GET  /api/admin/proxy-conflicts` / `POST /api/admin/proxy-conflicts/{id}/resolve`
+- `GET  /api/admin/proxy-revocations` / `GET /api/admin/people/{id}/proxy`
+
+门点代理核验（Bearer 门点令牌）
+
+- `POST /api/gate/proxy/verify` `{gate_id, code, attempt_id, original_person_id, proxy_person_id, original_ticket_code?, event_ts?}`
+- `POST /api/gate/proxy/replay` `{gate_id, base_version, events:[{code, attempt_id, original_person_id, proxy_person_id, original_ticket_code?, event_ts?}]}`
+
 ## 测试
 
 ```bash
 pip install pytest httpx
 python3 -m pytest tests/ -q
-# 87 passed
 ```
 
 测试启动真实 uvicorn 子进程打真实 HTTP，包含：双门点线程屏障并发核销（连跑多轮验证）、
@@ -273,7 +314,10 @@ attempt 幂等、未到场/已离场的明确拒绝、离场不被重放/重扫�
 **同门点并发上报恰一个推进**、完成/违规终态不被旧事件改回、暂停只挡未来使用而在途走旧版本、
 发新版本后在途固化 v1 而新票走 v2、未开始票可改绑/已开始拒绝、离线按序补齐与幂等、
 缺口/终态后到达/未来时间戳落冲突队列、管理员 APPLIED/MARK_VIOLATED/DISMISSED 处理且记录保留、
-路线事件经 /gate/sync 按版本补齐、按分区/路线/人员/违规历史查询、**重启后执行状态/版本固化/冲突全部延续**。
+路线事件经 /gate/sync 按版本补齐、按分区/路线/人员/违规历史查询、**重启后执行状态/版本固化/冲突全部延续**；
+授权委托：高风险两管理员审批、非名单审批拒绝、批准后凭证签发、四要素缺一即拒、
+同 attempt 重放不重复消耗、并发次数不超扣、过期/撤销/用尽终态不复活、离线旧事件落冲突并可人工处理、
+多维查询审批/次数/拒绝原因/撤销历史与版本事件。
 
 > 注意：`tests/test_zones.py` 依赖在 `test_system.py` 之后运行（pytest 默认按文件名字序），
 > 因为 test_system 的用例假定“尚未发布任何封锁规则”（门点策略版本为 0）。
@@ -293,6 +337,11 @@ attempt 幂等、未到场/已离场的明确拒绝、离场不被重放/重扫�
 `route_id/route_version` 列，并新建 `routes` / `route_versions` / `route_checkpoints` /
 `route_bindings` / `route_progress` / `route_checks` / `route_event_conflicts` 表；
 在途路线执行的版本号在 `route_progress` 中固化，迁移不影响既有票与在场记录。
+授权委托模块上线时再次重建 `events` 以加入 `DELEGATION_*`、`PROXY_CREDENTIAL_*`、
+`PROXY_VERIFICATION_*`、`PROXY_CONFLICT*` 类型和 `delegation_id` /
+`proxy_credential_code` / `proxy_verification_id` / `proxy_conflict_id` 列，
+并新建 `delegations` / `delegation_approvals` / `proxy_credentials` /
+`proxy_verifications` / `proxy_conflicts` / `proxy_revocations` 表；历史版本号连续保留。
 若库中存在旧版空脚手架表 `presence`（旧枚举 `ON_SITE/ABSENT`）、`presence_corrections`、
 `exit_attempts`、`muster_snapshots`、`muster_entries`，启动时仅在它们**全部为空**时丢弃并按
 新 schema 重建；任何一张含数据都会拒绝启动迁移以免静默丢轨迹，需人工核对。

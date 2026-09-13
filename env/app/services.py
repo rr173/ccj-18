@@ -2858,6 +2858,19 @@ def stats(conn: sqlite3.Connection) -> dict:
         "SELECT COUNT(*) c, COALESCE(SUM(party_size),0) p FROM presence "
         "WHERE status='ARRIVED'"
     ).fetchone()
+    from . import delegations
+    delegations_counts = {
+        s: conn.execute(
+            "SELECT COUNT(*) c FROM delegations WHERE status=?", (s,)
+        ).fetchone()["c"]
+        for s in ("PENDING", "APPROVED", "REJECTED", "REVOKED", "EXPIRED")
+    }
+    proxy_counts = {
+        s: conn.execute(
+            "SELECT COUNT(*) c FROM proxy_credentials WHERE status=?", (s,)
+        ).fetchone()["c"]
+        for s in ("ACTIVE", "REVOKED", "EXPIRED", "EXHAUSTED")
+    }
     return {
         "now": now_str,
         "tickets": counts,
@@ -2898,5 +2911,10 @@ def stats(conn: sqlite3.Connection) -> dict:
         ).fetchone()["c"],
         "route_open_conflicts": conn.execute(
             "SELECT COUNT(*) c FROM route_event_conflicts WHERE status='OPEN'"
+        ).fetchone()["c"],
+        "delegations": delegations_counts,
+        "proxy_credentials": proxy_counts,
+        "proxy_open_conflicts": conn.execute(
+            "SELECT COUNT(*) c FROM proxy_conflicts WHERE status='OPEN'"
         ).fetchone()["c"],
     }
