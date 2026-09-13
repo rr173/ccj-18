@@ -127,7 +127,9 @@
     <div>
       <div class="card">
         <div class="tabs">
-          <button data-tab="batch" class="btn active">预约批次</button>
+          <button data-tab="presence" class="btn active">在场清册</button>
+          <button data-tab="rollcall" class="btn">应急清点</button>
+          <button data-tab="batch" class="btn">预约批次</button>
           <button data-tab="person" class="btn">按人查看</button>
           <button data-tab="ticket" class="btn">按票查看</button>
           <button data-tab="zone" class="btn">按分区查看</button>
@@ -135,7 +137,42 @@
           <button data-tab="attempts" class="btn">门点记录</button>
         </div>
 
-        <div id="tab-batch">
+        <div id="tab-presence">
+          <div class="row">
+            <select id="pr-view">
+              <option value="onsite">当前在场</option>
+              <option value="unconfirmed">未确认离场</option>
+              <option value="departed">已离场</option>
+              <option value="removed">误扫移除</option>
+              <option value="all">全部</option>
+            </select>
+            <select id="pr-zone"><option value="">全部分区</option></select>
+            <select id="pr-batch"><option value="">全部批次</option></select>
+          </div>
+          <div class="row">
+            <input id="pr-q" placeholder="按票号/申请人/人员标识过滤">
+            <button class="btn primary" id="btn-pr">刷新清册</button>
+          </div>
+          <div class="pill-row" id="pr-summary"></div>
+          <div class="section" id="pr-list"></div>
+          <div class="section" id="pr-detail"></div>
+        </div>
+
+        <div id="tab-rollcall" hidden>
+          <div class="row">
+            <input id="rc-reason" placeholder="清点原因（如：消防演练/安保事件）" style="flex:1">
+            <select id="rc-zone"><option value="">全部分区</option></select>
+            <select id="rc-batch"><option value="">全部批次</option></select>
+            <button class="btn danger" id="btn-rollcall">发起应急清点（生成不可变快照）</button>
+          </div>
+          <div class="row">
+            <select id="rc-list"><option value="">历史快照…</option></select>
+            <button class="btn primary" id="btn-rc-view">查看快照</button>
+          </div>
+          <div class="section" id="rc-detail"><p class="muted">快照固定发起瞬间的在场人员、同行名单、批次分区与最后门点；之后到场/离场/更正不会改写旧快照。</p></div>
+        </div>
+
+        <div id="tab-batch" hidden>
           <div class="row">
             <select id="bv-batch"></select>
             <button class="btn primary" id="btn-batchview">查看批次</button>

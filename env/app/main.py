@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import services
+from . import presence as presence_svc
 from .db import DB_PATH, connect, init_db, iso, parse_dt, utcnow
 from .services import SWEEP_INTERVAL
 
@@ -186,6 +187,33 @@ class ChangeCancelIn(BaseModel):
 
 class ChangeTokenIn(BaseModel):
     manage_token: str = Field(min_length=8, max_length=128)
+
+
+# ---------------- 在场清册 / 应急清点模型 ----------------
+
+class DepartureIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1, max_length=128)
+
+
+class CorrectionIn(BaseModel):
+    code: str = Field(min_length=1)
+    action: str = Field(min_length=4, max_length=16)
+    # MARK_ARRIVED 漏扫补登记 / MARK_DEPARTED 漏扫离场 / REMOVE 误扫移除 /
+    # RESTORE 纠正误离场或误移除
+    reason: str = Field(min_length=1, max_length=300)
+    gate_id: Optional[str] = Field(default=None, max_length=64)
+    operator: Optional[str] = Field(default=None, max_length=128)
+    party_size: Optional[int] = Field(default=None, ge=1, le=1001)
+    companion_names: Optional[list[str]] = None
+
+
+class RollcallIn(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=300)
+    zone_id: Optional[str] = Field(default=None, max_length=64)
+    batch_id: Optional[str] = Field(default=None, max_length=64)
+    operator: Optional[str] = Field(default=None, max_length=128)
 
 
 # ---------------- 健康检查 / 页面 ----------------
@@ -623,8 +651,126 @@ def admin_reject_change(
     return result
 
 
-# ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
+# ---------------- 访客在场清册 / 人工更正 / 应急清点（管理端） ----------------
 
+def _presence_operator(body) -> str:
+    return (body.operator.strip() if body.operator and body.operator.strip()
+            else "admin")
+
+
+@app.get("/api/admin/presence", dependencies=[Depends(require_admin)])
+def admin_list_presence(
+    view: str = Query(default="onsite"),
+    zone_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=2000),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """当前在场清册；view=unconfirmed 为未确认离场口径（当前=在场集合）。"""
+    status_filter = view.strip().upper()
+    try:
+        rows = presence_svc.list_presence(
+            conn, status_filter=status_filter, zone_id=zone_id,
+            batch_id=batch_id, person_id=person_id, q=q, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"view": status_filter, "count": len(rows),
+            "summary": presence_svc.roster_summary(conn), "presence": rows}
+
+
+@app.get("/api/admin/presence/summary", dependencies=[Depends(require_admin)])
+def admin_presence_summary(conn: sqlite3.Connection = Depends(get_conn)):
+    return presence_svc.roster_summary(conn)
+
+
+@app.get("/api/admin/presence/{code}", dependencies=[Depends(require_admin)])
+def admin_presence_detail(code: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = presence_svc.presence_detail(conn, code)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="票面或在场记录不存在")
+    return detail
+
+
+@app.post("/api/admin/presence/corrections", dependencies=[Depends(require_admin)])
+def admin_presence_correction(
+    body: CorrectionIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    """漏扫/误扫的人工更正（必须带原因；原始轨迹与操作者保留）。"""
+    result = presence_svc.manual_correction(
+        conn,
+        raw_code=body.code,
+        action=body.action.strip().upper(),
+        reason=body.reason,
+        operator=f"admin:{_presence_operator(body)}",
+        party_size=body.party_size,
+        companion_names=body.companion_names,
+        gate_id=body.gate_id,
+    )
+    http_status = result.pop("http_status", 200)
+    if http_status == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
+    if http_status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if http_status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=http_status, content=result)
+
+
+@app.get("/api/admin/presence-events", dependencies=[Depends(require_admin)])
+def admin_presence_events(
+    code: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"events": presence_svc.list_presence_events(
+        conn, code=code, person_id=person_id, limit=limit)}
+
+
+@app.post("/api/admin/rollcalls", dependencies=[Depends(require_admin)])
+def admin_take_rollcall(
+    body: RollcallIn, conn: sqlite3.Connection = Depends(get_conn)
+):
+    """发起应急清点：固定当时在场人员、同行名单、批次分区与最后门点。"""
+    result = presence_svc.take_rollcall(
+        conn,
+        operator=f"admin:{_presence_operator(body)}",
+        reason=body.reason,
+        zone_id=body.zone_id,
+        batch_id=body.batch_id,
+    )
+    http_status = result.pop("http_status", 201)
+    if http_status == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
+    if http_status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=http_status, content=result)
+
+
+@app.get("/api/admin/rollcalls", dependencies=[Depends(require_admin)])
+def admin_list_rollcalls(
+    zone_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"rollcalls": presence_svc.list_rollcalls(
+        conn, zone_id=zone_id, batch_id=batch_id, person_id=person_id)}
+
+
+@app.get("/api/admin/rollcalls/{rc_id}", dependencies=[Depends(require_admin)])
+def admin_rollcall_detail(rc_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    rc = presence_svc.get_rollcall(conn, rc_id)
+    if rc is None:
+        raise HTTPException(status_code=404, detail="清点快照不存在")
+    return rc
+
+
+# ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
 @app.get("/api/public/batches/{token}")
 def public_batch(token: str, conn: sqlite3.Connection = Depends(get_conn)):
     view = services.public_batch_view(conn, token)
@@ -743,6 +889,23 @@ def gate_sync(
     return services.get_events_since(
         conn, since_version=body.since_version, gate_id=body.gate_id
     )
+
+
+@app.post("/api/gate/departure", dependencies=[Depends(require_gate)])
+def gate_departure(
+    body: DepartureIn,
+    gate=Depends(require_active_gate),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """门点确认持票人离场（同样以 attempt_id 保证离线重发幂等）。"""
+    result = presence_svc.gate_departure(
+        conn,
+        gate_id=body.gate_id,
+        raw_code=body.code,
+        attempt_id=body.attempt_id,
+    )
+    return JSONResponse(
+        status_code=result["http_status"], content=result["response"])
 
 
 @app.get("/api/gate/heartbeat/{gate_id}", dependencies=[Depends(require_gate)])

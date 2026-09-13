@@ -177,14 +177,26 @@ def test_sync_catchup_by_version(srv):
 
     batch1 = c.post("/api/gate/sync",
                     json={"gate_id": "g2", "since_version": since}).json()
-    new_versions = [e["version"] for e in batch1["events"]]
+    # 事件可能超过单页（200 条）：翻页拉全后再断言
+    pages = [batch1]
+    while pages[-1].get("has_more"):
+        pages.append(c.post("/api/gate/sync", json={
+            "gate_id": "g2",
+            "since_version": pages[-1]["next_since"]}).json())
+    all_events = [e for p in pages for e in p["events"]]
+    batch1["events"] = all_events
+    batch1["next_since"] = pages[-1]["next_since"]
+    new_versions = [e["version"] for e in all_events]
     assert new_versions == sorted(new_versions)
     assert all(v > since for v in new_versions)
 
-    kinds = {e["ticket_code"]: e["type"] for e in batch1["events"]}
-    assert kinds[t1["code"]] == "TICKET_REDEEMED"
-    assert kinds[t2["code"]] == "TICKET_REVOKED"
-    assert kinds[t3["code"]] == "TICKET_EXPIRED"
+    kinds = {}
+    for e in batch1["events"]:
+        kinds.setdefault(e["ticket_code"], []).append(e["type"])
+    # 核销成功后同一事务紧跟一条到场登记事件（门点按版本一并补齐）
+    assert kinds[t1["code"]][-2:] == ["TICKET_REDEEMED", "PRESENCE_ARRIVED"]
+    assert kinds[t2["code"]][-1] == "TICKET_REVOKED"
+    assert kinds[t3["code"]][-1] == "TICKET_EXPIRED"
 
     # 补齐后 g2 对 t1 核销必须得到“已使用”，且知道是 g1 核销的
     r = redeem(srv, t1["code"], "g2")

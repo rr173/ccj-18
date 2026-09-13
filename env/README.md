@@ -10,7 +10,13 @@
   审核通过在同一事务签发与批次分区一致的通行票；访客可凭管理令牌申请变更，管理员审核后
   原子换发新票（旧票作废并指向新票），申请带单调变更版本；门点核销可见批次、变更版本、
   同行总人数与同行人名单。
-- `tests/` 含 44 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
+- **访客在场清册 + 应急清点**：核销成功即在同一事务登记到场（申请人 + 同行人数/名单
+  当场冻结），门点确认离场；到场、离场与管理员人工更正共用同一写锁排成唯一顺序，
+  已离场的人不会因重放/重扫/并发回到在场名单；漏扫/误扫可由管理员带原因人工更正，
+  原始轨迹与操作者保留；应急清点生成**不可变快照**（在场人员、同行名单、批次分区、
+  最后门点记录全部冻结，之后变化不改旧快照）；四类事件进同一版本流，门点离线重连
+  按版本补齐。
+- `tests/` 含 57 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
 
 ## 需求对应的关键保证
 
@@ -56,6 +62,20 @@
 | 离线重连按版本补齐预约与票据变化 | 预约事件（`BATCH_*` / `APPLICATION_*`）与票据/策略事件共用同一 append-only 版本流，门点 `/api/gate/sync` 无需改造即可按版本补齐 |
 | 管理员按批次查看申请、候补顺序、已签发票、容量变化 | `GET /api/admin/batches/{id}`：批次占用计数、全部申请（含候补名次/晋级时间）、候补队列、已签发票、`batch_capacity_log`、批次事件流水 |
 | 批次提前关闭 / 容量调整 | `POST .../close` 停止接受新申请（已签票不受影响）；`PUT .../capacity` 不允许低于当前占座数，调高时同事务自动晋级候补 |
+
+### 访客在场清册与应急清点的关键保证
+
+| 需求 | 实现方式 |
+|---|---|
+| 核销成功登记到场（申请人 + 同行人数） | 核销条件 UPDATE 成功后在**同一 IMMEDIATE 事务**写 `presence`（一 票一行）+ `PRESENCE_ARRIVED` 事件；整组人数、同行人名单、分区、批次、到场门点当场冻结 |
+| 离场由门点确认 | `POST /api/gate/departure`（同样以 `(gate_id, attempt_id)` 幂等，离线重发只离场一次），只有当前 `ARRIVED` 可离场；未到场 409 `no_presence`、已离场/移除 409 `not_present`，票面不存在 404 |
+| 到场/离场/人工更正并发只能有一个明确顺序 | 三者全部在 `BEGIN IMMEDIATE` 写事务内串行；`presence_events` 按票单调 `seq`，状态机 `ARRIVED→DEPARTED` / `→REMOVED`；并发落败方拿到 409，不会产生半截状态 |
+| 已离场的人不能又出现在当前在场名单 | 当前在场名单固定为 `presence.status='ARRIVED'`；门点自动路径（核销/离场）在 `DEPARTED/REMOVED` 下不写入，核销重放仍只返回 `already_redeemed`。只有管理员**显式带原因**的 RESTORE/补登记才能纠正回场 |
+| 漏扫/误扫人工更正，带原因且保留原始轨迹与操作者 | `POST /api/admin/presence/corrections`：`MARK_ARRIVED`（漏扫到场；票仍 ACTIVE 时同事务核销）、`MARK_DEPARTED`（漏扫离场）、`REMOVE`（误扫移除）、`RESTORE`（纠正回场）；原因必填，只向 `presence_events` 与 `PRESENCE_CORRECTED` 事件**追加**，从不删除/改写既有的到场、离场记录 |
+| 应急清点快照固定当时在场人员、同行名单、批次分区与最后门点 | `POST /api/admin/rollcalls` 在单个事务内把当时全部在场组（可按分区/批次过滤）逐行复制到 `rollcall_entries`；快照表只插入、无更新/删除接口；之后到场/离场/更正只追加事件、产生新快照，旧快照字节级不变（测试逐条比对） |
+| 快照之后的变化不能改写旧快照 | 快照存的是冻结副本（人数/名单/`last_gate`/`last_event_version`/`presence_seq` 都是值拷贝），不与 `presence` 做任何 JOIN |
+| 门点离线重连补齐到离场、更正与清点快照事件 | `PRESENCE_ARRIVED` / `PRESENCE_DEPARTED` / `PRESENCE_CORRECTED` / `ROLLCALL_TAKEN` 与票据、策略事件共用同一 append-only 版本流；`/api/gate/sync` 无需特殊处理即按版本有序补齐 |
+| 按分区、批次、人员查询当前在场 / 未确认离场 / 任一次清点结果 | `GET /api/admin/presence?view=onsite\|unconfirmed\|departed\|removed\|all&zone_id=&batch_id=&person_id=&q=`；`GET /api/admin/rollcalls?zone_id=&batch_id=&person_id=`（按人命中其当时在场的快照）；`GET /api/admin/rollcalls/{id}` 取冻结明细；另有 `GET /api/admin/presence/{code}` 单票完整轨迹 |
 
 ### 核销响应约定（门点端可直接据此亮灯/播报）
 
@@ -120,6 +140,8 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 5. 网络断开时扫码进入本地队列，重连后自动补提交；同时按版本号补齐离线期间的作废/核销/过期/**封锁规则**事件，页面显示补齐日志与当前策略版本。若核销被拒为“规则版本过旧”，门点会自动补齐后用同一次扫码重试。
 6. 管理台「按分区查看」可看到：分区当前规则与历史版本、受影响票据、本分区门点的执行记录；「按人查看」可看到：当前可用票数、每张票的终态与原因、状态流水版本、各门点扫码成功/拒绝记录。
 7. 访客预约：「访客预约批次」卡片填日期/时段/分区/人数上限建批，复制生成的 `/apply?k=…` 链接发给访客；访客提交（可填每位同行人姓名）后容量内为“待审核”，满额自动进候补。右侧「预约批次」标签可按批次审核/取消/拒绝/补录、调整容量、关闭申请、查看候补顺序、已签发票、**申请变更审核队列**与容量变化记录；访客凭申请后保存的管理链接可发起/撤回变更，审核通过后系统原子换发新票，门点扫到旧票会提示改扫新票。
+8. 在场清册：门点台用「入场核销/离场确认」下拉切换模式（离场扫码同样离线排队、attempt 幂等）；管理台「在场清册」标签可按当前在场/未确认离场/已离场/误扫移除与分区、批次、人员过滤，点开任一票查看完整在场轨迹并对漏扫（补登记到场/登记离场）、误扫（移除/纠正回场）做**带原因**的人工更正，更正只追加轨迹、保留操作者。
+9. 应急清点：「应急清点」标签填原因（可选分区/批次范围）一键发起，快照固定当时在场人员、同行名单、批次分区与最后门点；历史快照随时回看，发起后的到场/离场/更正不会改写旧快照。
 
 ## API 摘要
 
@@ -165,15 +187,26 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 门点端（`Authorization: Bearer <PASSPORT_GATE_TOKEN>`）
 
 - `POST /api/gate/redeem` `{gate_id, code, attempt_id, policy_version}`
-- `POST /api/gate/sync` `{gate_id, since_version}` → `{events:[...], next_since, has_more}`（含封锁策略事件）
+- `POST /api/gate/departure` `{gate_id, code, attempt_id}`（门点确认离场；同样以 attempt_id 幂等）
+- `POST /api/gate/sync` `{gate_id, since_version}` → `{events:[...], next_since, has_more}`（含封锁策略、到场/离场/更正/清点事件）
 - `GET  /api/gate/heartbeat/{gate_id}`
+
+在场清册与应急清点（管理端，Bearer 管理员令牌）
+
+- `GET  /api/admin/presence?view=onsite|unconfirmed|departed|removed|all&zone_id=&batch_id=&person_id=&q=`（当前在场/未确认离场/已离场/误扫移除；含按分区、批次、人员、关键字过滤与汇总）
+- `GET  /api/admin/presence/summary`（在场组数/人数，按分区、批次拆分）
+- `GET  /api/admin/presence/{code}`（单票当前状态 + append-only 在场轨迹，含每次人工更正的操作者与原因）
+- `POST /api/admin/presence/corrections` `{code, action: "MARK_ARRIVED"|"MARK_DEPARTED"|"REMOVE"|"RESTORE", reason, gate_id?, operator?, party_size?, companion_names?}`（漏扫/误扫人工更正，原因必填；原轨迹保留）
+- `GET  /api/admin/presence-events?code=&person_id=`（在场轨迹总流水）
+- `POST /api/admin/rollcalls` `{reason, zone_id?, batch_id?, operator?}` → 201 不可变快照
+- `GET  /api/admin/rollcalls?zone_id=&batch_id=&person_id=` / `GET /api/admin/rollcalls/{id}`（历史清点列表 / 任一次清点的冻结明细）
 
 ## 测试
 
 ```bash
 pip install pytest httpx
 python3 -m pytest tests/ -q
-# 44 passed
+# 57 passed
 ```
 
 测试启动真实 uvicorn 子进程打真实 HTTP，包含：双门点线程屏障并发核销（连跑多轮验证）、
@@ -187,7 +220,12 @@ python3 -m pytest tests/ -q
 申请变更：变更请求幂等/单待审/无差异 noop、已通过变更原子换票（旧票 REVOKED+新票 ACTIVE 同事务、
 替换链与原因可追溯、旧票门点 410 指向新票）、已核销不可变更、并发变更不超容量、
 候补按新总人数重排晋级、拒绝/撤回/过期变更不发票、待审变更随申请终结、
-门点核销显示变更版本与同行名单、门点同步补齐撤销/换发事件、重启后版本与替换链延续。
+门点核销显示变更版本与同行名单、门点同步补齐撤销/换发事件、重启后版本与替换链延续；
+在场清册与应急清点：核销自动登记到场（整组人数/名单/分区/批次/门点冻结）、门点确认离场与
+attempt 幂等、未到场/已离场的明确拒绝、离场不被重放/重扫复活、到场-离场-人工更正并发唯一顺序、
+漏扫补登记（票同事务核销）、漏扫离场、误扫移除、纠正回场且原轨迹保留、
+快照固定且随后变化不改旧快照、按分区/批次范围清点、按分区/批次/人员查询清册与任一次清点、
+门点按版本补齐四类新事件、重启后在场状态/轨迹/快照延续。
 
 > 注意：`tests/test_zones.py` 依赖在 `test_system.py` 之后运行（pytest 默认按文件名字序），
 > 因为 test_system 的用例假定“尚未发布任何封锁规则”（门点策略版本为 0）。
@@ -196,9 +234,15 @@ python3 -m pytest tests/ -q
 
 启动时自动就地迁移：`gates` 加 `zone_id` 列、`tickets` 加 `zones` 列（默认 `[]`）并在引入
 预约批次后再加 `batch_id` / `application_id` / `party_size` 列、
-重建 `events` 表以扩展事件类型 CHECK（并加 `batch_id` / `application_id` 列；申请变更上线时再次重建以加入 5 个 `APPLICATION_CHANGE_*` 类型），
+重建 `events` 表以扩展事件类型 CHECK（并加 `batch_id` / `application_id` / `rollcall_id` 列；
+申请变更上线时再次重建以加入 5 个 `APPLICATION_CHANGE_*` 类型；在场清册上线时第三次重建以加入
+`PRESENCE_ARRIVED/PRESENCE_DEPARTED/PRESENCE_CORRECTED/ROLLCALL_TAKEN` 类型），
 新建 `batches` / `applications` / `batch_capacity_log` / `application_changes` 表，
-`applications` 加 `change_version` / `companion_names` 列，`tickets` 加 `replaced_code` / `replaced_by_code` / `replacement_reason` 列（事件与版本号完整保留、继续递增）。
+以及在场清册的 `presence` / `presence_events` 与应急清点的 `rollcalls` / `rollcall_entries` 表
+（事件与版本号完整保留、继续递增）。
+若库中存在旧版空脚手架表 `presence`（旧枚举 `ON_SITE/ABSENT`）、`presence_corrections`、
+`exit_attempts`、`muster_snapshots`、`muster_entries`，启动时仅在它们**全部为空**时丢弃并按
+新 schema 重建；任何一张含数据都会拒绝启动迁移以免静默丢轨迹，需人工核对。
 **注意**：升级前已存在的票 `zones` 为空数组，按“未授权任何分区”处理，在所有门点都会被
 `zone_mismatch` 拒绝；需要的话请作废旧票并按分区重新签发。
 

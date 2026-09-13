@@ -58,6 +58,12 @@ EVENT_TYPES = (
     "APPLICATION_CHANGE_REJECTED",
     "APPLICATION_CHANGE_CANCELLED",
     "APPLICATION_CHANGE_EXPIRED",
+    # 访客在场清册：到场（门点核销成功/管理员补登记）/ 离场（门点确认）/ 人工更正
+    "PRESENCE_ARRIVED",
+    "PRESENCE_DEPARTED",
+    "PRESENCE_CORRECTED",
+    # 应急清点：管理员发起一次快照（快照本体落 rollcall* 表，事件进版本流）
+    "ROLLCALL_TAKEN",
 )
 RULE_ACTIONS = ("LOCK", "UNLOCK")
 
@@ -137,14 +143,17 @@ CREATE TABLE IF NOT EXISTS events (
                        'APPLICATION_CANCELLED','APPLICATION_REJECTED','APPLICATION_EXPIRED',
                        'APPLICATION_CHANGE_SUBMITTED','APPLICATION_CHANGE_APPROVED',
                        'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
-                       'APPLICATION_CHANGE_EXPIRED')),
+                       'APPLICATION_CHANGE_EXPIRED',
+                       'PRESENCE_ARRIVED','PRESENCE_DEPARTED','PRESENCE_CORRECTED',
+                       'ROLLCALL_TAKEN')),
     ticket_code    TEXT,
     person_id      TEXT,
     gate_id        TEXT,
     reason         TEXT,
     payload        TEXT NOT NULL,
     batch_id       TEXT,
-    application_id TEXT
+    application_id TEXT,
+    rollcall_id    TEXT               -- ROLLCALL_TAKEN 事件：对应快照
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
@@ -263,6 +272,116 @@ CREATE TABLE IF NOT EXISTS application_changes (
 CREATE INDEX IF NOT EXISTS idx_changes_app ON application_changes(application_id);
 CREATE INDEX IF NOT EXISTS idx_changes_batch ON application_changes(batch_id, status);
 CREATE INDEX IF NOT EXISTS idx_changes_status ON application_changes(status);
+
+-- 访客在场清册：每张票至多一行（核销成功即登记到场）。
+--   状态机 ARRIVED -> DEPARTED（门点确认离场）
+--               \-> REMOVED （管理员误扫更正：从在场名单移除）
+--   DEPARTED/REMOVED 下门点自动路径不可再写；管理员可凭原因做人工更正，
+--   更正只追加 presence_events 轨迹，不抹掉任何历史。
+-- 同行名单/人数/分区/批次在到场瞬间冻结：之后申请变更换发的是新票（旧票
+-- 已核销根本不能变更），快照与轨迹都不会被后续变化改写。
+CREATE TABLE IF NOT EXISTS presence (
+    ticket_code     TEXT PRIMARY KEY,
+    person_id       TEXT NOT NULL,
+    application_id  TEXT,
+    batch_id        TEXT,
+    zone_id         TEXT,
+    status          TEXT NOT NULL
+                    CHECK (status IN ('ARRIVED','DEPARTED','REMOVED')),
+    party_size      INTEGER NOT NULL,     -- 到场冻结：含申请人的整组人数
+    companions      INTEGER NOT NULL DEFAULT 0,
+    companion_names TEXT NOT NULL DEFAULT '[]',  -- 到场冻结的同行人名单 JSON
+    applicant_name  TEXT,
+    arrived_at      TEXT NOT NULL,
+    arrived_gate    TEXT,                 -- 到场门点（人工补登记为 NULL）
+    arrived_version INTEGER NOT NULL,     -- 到场事件全局版本
+    arrived_event_id INTEGER,             -- 对应 presence_events.id
+    departed_at     TEXT,
+    departed_gate   TEXT,
+    departed_version INTEGER,
+    departed_event_id INTEGER,
+    removed_at      TEXT,                 -- 最近一次人工更正时间
+    removed_reason  TEXT,
+    removed_by      TEXT,                 -- 操作者（管理员令牌身份/门点）
+    corrected_seq   INTEGER NOT NULL DEFAULT 0  -- 最近一次人工更正序号
+);
+CREATE INDEX IF NOT EXISTS idx_presence_status ON presence(status);
+CREATE INDEX IF NOT EXISTS idx_presence_batch ON presence(batch_id);
+CREATE INDEX IF NOT EXISTS idx_presence_zone ON presence(zone_id);
+CREATE INDEX IF NOT EXISTS idx_presence_person ON presence(person_id);
+CREATE INDEX IF NOT EXISTS idx_presence_app ON presence(application_id);
+
+-- 在场轨迹（append-only）：到场 / 离场 / 人工更正，按票内 seq 形成唯一明确顺序；
+-- version 同时写入全局 events.id，门点离线重连按版本补齐。
+CREATE TABLE IF NOT EXISTS presence_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_code TEXT NOT NULL,
+    person_id   TEXT NOT NULL,
+    seq         INTEGER NOT NULL,         -- 该票内单调序号（1=到场）
+    kind        TEXT NOT NULL
+                CHECK (kind IN ('ARRIVED','DEPARTED',
+                                'MARK_ARRIVED','MARK_DEPARTED',
+                                'REMOVE','RESTORE')),
+    from_status TEXT,                     -- 变更前 presence.status
+    to_status   TEXT NOT NULL,            -- 变更后 presence.status
+    reason      TEXT,                     -- 门点动作或人工更正原因
+    operator    TEXT NOT NULL,            -- 操作者：gate:<id> / admin / admin:<id>
+    gate_id     TEXT,
+    version     INTEGER,                  -- 对应全局 events.id（门点补齐游标）
+    attempt_id  TEXT,                     -- 门点动作的幂等键
+    ts          TEXT NOT NULL,
+    UNIQUE (ticket_code, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_presence_events_ticket ON presence_events(ticket_code, seq);
+CREATE INDEX IF NOT EXISTS idx_presence_events_version ON presence_events(version);
+-- 门点离场扫码幂等：同一次物理扫码（gate_id, attempt_id）只离场一次。
+-- 只约束门点动作（MARK_* 人工更正没有 attempt_id），到场动作在 scan_attempts
+-- 唯一约束上已经幂等（核销一次即 REDEEMED），这里额外兜底。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_presence_gate_attempt
+    ON presence_events(gate_id, attempt_id)
+    WHERE attempt_id IS NOT NULL AND kind IN ('ARRIVED','DEPARTED');
+
+-- 应急清点快照：发起瞬间固定。行只插入、永不更新/删除（无任何改写 API）。
+CREATE TABLE IF NOT EXISTS rollcalls (
+    id          TEXT PRIMARY KEY,         -- R-XXXXXXXX
+    reason      TEXT,
+    zone_id     TEXT,                     -- 可选：只清点某分区
+    batch_id    TEXT,                     -- 可选：只清点某批次
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL,            -- 操作者
+    version     INTEGER NOT NULL,         -- ROLLCALL_TAKEN 全局版本
+    headcount   INTEGER NOT NULL,         -- 在场总人数（含同行人，冻结值）
+    groups      INTEGER NOT NULL,         -- 在场组数（申请人数，冻结值）
+    scope_json  TEXT NOT NULL DEFAULT '{}'  -- 发起时的范围说明（分区/批次名等）
+);
+CREATE INDEX IF NOT EXISTS idx_rollcalls_created ON rollcalls(created_at);
+
+-- 清点条目：发起瞬间所有在场（ARRIVED）组逐行冻结
+CREATE TABLE IF NOT EXISTS rollcall_entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rollcall_id     TEXT NOT NULL,
+    ticket_code     TEXT NOT NULL,
+    person_id       TEXT NOT NULL,
+    application_id  TEXT,
+    batch_id        TEXT,
+    zone_id         TEXT,
+    applicant_name  TEXT,
+    party_size      INTEGER NOT NULL,
+    companions      INTEGER NOT NULL,
+    companion_names TEXT NOT NULL DEFAULT '[]',
+    arrived_at      TEXT NOT NULL,
+    arrived_gate    TEXT,
+    last_gate       TEXT,                 -- 最后门点记录（到场门点或最近离场/更正门点）
+    last_event_kind TEXT NOT NULL,        -- 最后一条在场轨迹类型
+    last_event_ts   TEXT NOT NULL,
+    last_event_version INTEGER NOT NULL,
+    presence_seq    INTEGER NOT NULL,     -- 发起时该票轨迹长度
+    UNIQUE (rollcall_id, ticket_code)
+);
+CREATE INDEX IF NOT EXISTS idx_rollcall_entries_rc ON rollcall_entries(rollcall_id);
+CREATE INDEX IF NOT EXISTS idx_rollcall_entries_batch ON rollcall_entries(batch_id);
+CREATE INDEX IF NOT EXISTS idx_rollcall_entries_zone ON rollcall_entries(zone_id);
+CREATE INDEX IF NOT EXISTS idx_rollcall_entries_person ON rollcall_entries(person_id);
 """
 
 
@@ -304,10 +423,57 @@ def init_db() -> None:
         # WAL 模式持久化在数据库文件上；配合 BEGIN IMMEDIATE 实现单写多读
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
+        _drop_legacy_scaffolds(conn)
         conn.executescript(SCHEMA)
         _migrate(conn)
     finally:
         conn.close()
+
+
+# 旧版本曾以不同 schema 建过一批空脚手架表（在场状态枚举为
+# ON_SITE/DEPARTED/ABSENT、清点叫 muster_*、离场尝试单走 exit_attempts）。
+# 它们与本模块 schema 不兼容；仅在“全部为空”时丢弃重建。任何一张非空
+# （说明旧版本实际写过数据）都拒绝自动处理，避免静默丢轨迹。
+_LEGACY_SCAFFOLDS = (
+    "presence", "presence_corrections", "exit_attempts",
+    "muster_snapshots", "muster_entries",
+)
+# 只有检测到旧版特征列/枚举时才认定是旧脚手架（新版 presence 有 arrived_version）
+_LEGACY_MARK_SQL = {
+    "presence": "SELECT 1 FROM pragma_table_info('presence') WHERE name='last_event_version'",
+    "presence_corrections": "SELECT 1 FROM sqlite_master WHERE type='table' AND name='presence_corrections'",
+    "exit_attempts": "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exit_attempts'",
+    "muster_snapshots": "SELECT 1 FROM sqlite_master WHERE type='table' AND name='muster_snapshots'",
+    "muster_entries": "SELECT 1 FROM sqlite_master WHERE type='table' AND name='muster_entries'",
+}
+
+
+def _drop_legacy_scaffolds(conn: sqlite3.Connection) -> None:
+    existing = {}
+    for table, probe in _LEGACY_MARK_SQL.items():
+        if conn.execute(probe).fetchone() is not None:
+            existing[table] = conn.execute(
+                f"SELECT COUNT(*) c FROM {table}"
+            ).fetchone()["c"]
+    if not existing:
+        return
+    nonempty = {t: n for t, n in existing.items() if n > 0}
+    if nonempty:
+        raise RuntimeError(
+            "检测到旧版在场/清点脚手架表中存在数据，拒绝自动迁移以免丢失轨迹: "
+            f"{nonempty}；请人工核对后处理（这些表使用旧枚举 ON_SITE/ABSENT 与 "
+            "muster_* 命名，与当前版本不兼容）"
+        )
+    # 先删依赖旧表的索引，再丢空表；IF EXISTS 保证可重复执行
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table in _LEGACY_SCAFFOLDS:
+            if table in existing:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -350,7 +516,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if row and (
         "APPLICATION_SUBMITTED" not in row["sql"]
         or "APPLICATION_CHANGE_SUBMITTED" not in row["sql"]
+        or "PRESENCE_ARRIVED" not in row["sql"]
         or "batch_id" not in row["sql"]
+        or "rollcall_id" not in row["sql"]
     ):
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -369,22 +537,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
                                           'APPLICATION_REJECTED','APPLICATION_EXPIRED',
                                           'APPLICATION_CHANGE_SUBMITTED','APPLICATION_CHANGE_APPROVED',
                                           'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
-                                          'APPLICATION_CHANGE_EXPIRED')),
+                                          'APPLICATION_CHANGE_EXPIRED',
+                                          'PRESENCE_ARRIVED','PRESENCE_DEPARTED',
+                                          'PRESENCE_CORRECTED','ROLLCALL_TAKEN')),
                        ticket_code    TEXT,
                        person_id      TEXT,
                        gate_id        TEXT,
                        reason         TEXT,
                        payload        TEXT NOT NULL,
                        batch_id       TEXT,
-                       application_id TEXT
+                       application_id TEXT,
+                       rollcall_id    TEXT
                    )"""
             )
+            # 老库可能还没有 batch_id/application_id 列（逐版补齐，列不存在先补 NULL）
+            old_cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+            select_batch = "batch_id" if "batch_id" in old_cols else "NULL"
+            select_app = "application_id" if "application_id" in old_cols else "NULL"
             conn.execute(
-                """INSERT INTO events_new
+                f"""INSERT INTO events_new
                        (id,ts,type,ticket_code,person_id,gate_id,reason,payload,
-                        batch_id,application_id)
+                        batch_id,application_id,rollcall_id)
                    SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload,
-                          NULL,NULL
+                          {select_batch},{select_app},NULL
                      FROM events"""
             )
             conn.execute("DROP TABLE events")
@@ -442,12 +617,13 @@ def add_event(
     payload: Optional[dict] = None,
     batch_id: Optional[str] = None,
     application_id: Optional[str] = None,
+    rollcall_id: Optional[str] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO events
                (ts, type, ticket_code, person_id, gate_id, reason, payload,
-                batch_id, application_id)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+                batch_id, application_id, rollcall_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             ts,
             event_type,
@@ -458,6 +634,7 @@ def add_event(
             json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
             batch_id,
             application_id,
+            rollcall_id,
         ),
     )
     return int(cur.lastrowid)

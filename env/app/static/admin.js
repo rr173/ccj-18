@@ -17,16 +17,166 @@ $("saveToken").onclick = () => {
 };
 
 // ---------------- Tabs ----------------
+const TAB_IDS = ["presence", "rollcall", "batch", "person", "ticket", "zone",
+                 "events", "attempts"];
 document.querySelectorAll(".tabs button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    ["batch", "person", "ticket", "zone", "events", "attempts"].forEach(t =>
-      $(`tab-${t}`).hidden = t !== btn.dataset.tab);
+    TAB_IDS.forEach(t => $(`tab-${t}`).hidden = t !== btn.dataset.tab);
     if (btn.dataset.tab === "zone") loadZoneView();
     if (btn.dataset.tab === "batch") loadBatchView();
+    if (btn.dataset.tab === "presence") loadPresence();
+    if (btn.dataset.tab === "rollcall") loadRollcallList();
   };
 });
+
+const PRES_BADGE = {
+  ARRIVED: "ACTIVE", DEPARTED: "EXPIRED", REMOVED: "REVOKED",
+};
+const PRES_TEXT = { ARRIVED: "在场", DEPARTED: "已离场", REMOVED: "误扫移除" };
+const KIND_TEXT = {
+  ARRIVED: "门点到场", DEPARTED: "门点确认离场",
+  MARK_ARRIVED: "人工补登记到场", MARK_DEPARTED: "人工登记离场",
+  REMOVE: "人工移除（误扫）", RESTORE: "人工纠正回场",
+};
+
+async function loadPresence() {
+  try {
+    requireToken();
+    const params = new URLSearchParams({ view: $("pr-view").value, limit: "500" });
+    if ($("pr-zone").value) params.set("zone_id", $("pr-zone").value);
+    if ($("pr-batch").value) params.set("batch_id", $("pr-batch").value);
+    if ($("pr-q").value.trim()) params.set("q", $("pr-q").value.trim());
+    const v = await adminApi("GET", "/api/admin/presence?" + params.toString());
+    const s = v.summary;
+    $("pr-summary").innerHTML = [
+      ["在场组数", s.onsite_groups, "#4ade80"],
+      ["在场人数（含同行）", s.onsite_people, "#93c5fd"],
+      ["其中同行人", s.onsite_companions, "#c4b5fd"],
+      ["已离场组", s.departed_groups, "#fcd34d"],
+    ].map(([k, val, c]) => `<div class="stat"><b style="color:${c}">${val}</b>${k}</div>`).join("");
+    const rows = v.presence.map(p => `<tr>
+      <td class="mono code-cell">${esc(p.ticket_code)}</td>
+      <td>${esc(p.applicant_name || p.person_id)}<div class="muted" style="font-size:11px">${esc((p.companion_names || []).filter(Boolean).map(n => esc(n)).join("、"))}</div></td>
+      <td><b>${p.party_size}</b>（同行 ${p.companions}）</td>
+      <td><span class="badge ${PRES_BADGE[p.status]}">${PRES_TEXT[p.status] || p.status}</span></td>
+      <td class="mono">${esc(p.zone_id || "")}<div class="muted" style="font-size:11px">${esc(p.batch_id || "")}</div></td>
+      <td>${p.arrived_gate ? esc(p.arrived_gate) : "人工"}<div class="muted" style="font-size:11px">${fmtTime(p.arrived_at)}</div></td>
+      <td>${p.departed_gate ? esc(p.departed_gate) + "<div class='muted' style='font-size:11px'>" + fmtTime(p.departed_at) + "</div>" : (p.status === "REMOVED" ? "—" : '<span class="muted">未确认</span>')}</td>
+      <td><button class="btn small" onclick="loadPresenceDetail('${esc(p.ticket_code)}')">轨迹/更正</button></td>
+    </tr>`).join("");
+    $("pr-list").innerHTML = `<table><thead><tr>
+      <th>票号</th><th>申请人</th><th>整组</th><th>状态</th><th>分区/批次</th>
+      <th>到场</th><th>离场</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan=8 class=muted>无记录</td></tr>'}</tbody></table>`;
+  } catch (e) { toast(e.message, "error"); }
+}
+
+window.loadPresenceDetail = async code => {
+  try {
+    const d = await adminApi("GET", `/api/admin/presence/${encodeURIComponent(code)}`);
+    const trail = (d.trail || []).map(t => `<tr>
+      <td>${t.seq}</td><td><span class="badge ${t.to_status === "ARRIVED" ? "ACTIVE" : (t.to_status === "DEPARTED" ? "EXPIRED" : "REVOKED")}">${esc(KIND_TEXT[t.kind] || t.kind)}</span></td>
+      <td>${esc(t.from_status || "—")} → <b>${esc(t.to_status)}</b></td>
+      <td>${t.gate_id ? esc(t.gate_id) : "—"}</td>
+      <td>${esc(t.operator || "")}</td>
+      <td>${esc(t.reason || "")}</td>
+      <td>${fmtTime(t.ts)}<div class="muted" style="font-size:11px">#${t.version ?? ""}</div></td>
+    </tr>`).join("");
+    const p = d.presence;
+    $("pr-detail").innerHTML =
+      `<h2>${esc(code)} ${p ? `<span class="badge ${PRES_BADGE[p.status]}">${PRES_TEXT[p.status] || p.status}</span>` : '<span class="muted">无在场记录</span>'}</h2>
+       ${d.application ? `<p class="hint">申请 ${esc(d.application.id)} · ${esc(d.application.name)} · 资料版本 v${d.application.change_version}</p>` : ""}
+       <div class="row" style="margin-top:8px">
+         <input id="pc-reason" placeholder="更正原因（必填）" style="flex:1">
+         <select id="pc-gate"><option value="">门点（可选）</option></select>
+       </div>
+       <div class="row" style="margin-top:6px">
+         <button class="btn primary" onclick="presenceCorrect('${esc(code)}','MARK_ARRIVED')">漏扫：补登记到场</button>
+         <button class="btn" onclick="presenceCorrect('${esc(code)}','MARK_DEPARTED')">漏扫：登记离场</button>
+         <button class="btn danger" onclick="presenceCorrect('${esc(code)}','REMOVE')">误扫：从在场移除</button>
+         <button class="btn primary" onclick="presenceCorrect('${esc(code)}','RESTORE')">纠正：重新计入在场</button>
+       </div>
+       <p class="hint">人工更正只追加轨迹（原始到场/离场不删除），记录操作者与原因；已离场的人不会被门点自动流程重新放回名单，RESTORE 必须管理员显式发起。</p>
+       <table><thead><tr><th>#</th><th>动作</th><th>状态变化</th><th>门点</th><th>操作者</th><th>原因</th><th>时间/版本</th></tr></thead>
+       <tbody>${trail || '<tr><td colspan=7 class=muted>无轨迹</td></tr>'}</tbody></table>`;
+    const gates = await adminApi("GET", "/api/admin/gates");
+    $("pc-gate").innerHTML = `<option value="">门点（可选）</option>` +
+      gates.gates.map(g => `<option value="${esc(g.id)}">${esc(g.id)} · ${esc(g.name)}</option>`).join("");
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.presenceCorrect = async (code, action) => {
+  const reason = $("pc-reason").value.trim();
+  if (!reason) return toast("人工更正必须填写原因", "error");
+  const gate_id = $("pc-gate").value || null;
+  if (!confirm(`${KIND_TEXT[action]}：${code}？\n原因：${reason}`)) return;
+  try {
+    await adminApi("POST", "/api/admin/presence/corrections",
+      { code, action, reason, gate_id });
+    toast("更正已记录（原轨迹保留）", "success");
+    await Promise.all([loadPresence(), loadPresenceDetail(code), loadStats()]);
+  } catch (e) { toast("更正失败：" + e.message, "error"); }
+};
+
+$("btn-pr").onclick = () => { try { requireToken(); loadPresence(); } catch (_) {} };
+
+// ---------------- 应急清点 ----------------
+$("btn-rollcall").onclick = async () => {
+  try {
+    requireToken();
+    const reason = $("rc-reason").value.trim();
+    if (!reason) return toast("请填写清点原因", "error");
+    const body = { reason };
+    if ($("rc-zone").value) body.zone_id = $("rc-zone").value;
+    if ($("rc-batch").value) body.batch_id = $("rc-batch").value;
+    if (!confirm("发起应急清点？快照一旦生成不可修改，之后的到场/离场不影响本快照。")) return;
+    const r = await adminApi("POST", "/api/admin/rollcalls", body);
+    toast(`清点快照 ${r.rollcall.id} 已生成：${r.rollcall.groups} 组 / ${r.rollcall.headcount} 人`, "success");
+    await loadRollcallList(r.rollcall.id);
+  } catch (e) { toast("清点失败：" + e.message, "error"); }
+};
+
+async function loadRollcallList(selectId) {
+  try {
+    requireToken();
+    const { rollcalls } = await adminApi("GET", "/api/admin/rollcalls?limit=100");
+    $("rc-list").innerHTML = `<option value="">历史快照（${rollcalls.length}）…</option>` +
+      rollcalls.map(r => `<option value="${esc(r.id)}">${esc(r.id)} · ${fmtTime(r.created_at)} · ${r.groups}组/${r.headcount}人${r.reason ? " · " + esc(r.reason) : ""}</option>`).join("");
+    if (selectId) { $("rc-list").value = selectId; await loadRollcallDetail(selectId); }
+  } catch (e) { /* 静默 */ }
+}
+
+window.loadRollcallDetail = async id => {
+  if (!id) return;
+  try {
+    const r = await adminApi("GET", `/api/admin/rollcalls/${encodeURIComponent(id)}`);
+    const scope = r.scope || {};
+    const rows = r.entries.map(e => `<tr>
+      <td class="mono code-cell">${esc(e.ticket_code)}</td>
+      <td>${esc(e.applicant_name || e.person_id)}<div class="muted" style="font-size:11px">${esc((e.companion_names || []).filter(Boolean).join("、"))}</div></td>
+      <td><b>${e.party_size}</b>（同行 ${e.companions}）</td>
+      <td class="mono">${esc(e.zone_id || "")}</td>
+      <td class="mono">${esc(e.batch_id || "")}</td>
+      <td>${e.arrived_gate ? esc(e.arrived_gate) : "人工"}<div class="muted" style="font-size:11px">${fmtTime(e.arrived_at)}</div></td>
+      <td>${esc(e.last_gate || "—")}<div class="muted" style="font-size:11px">${esc(KIND_TEXT[e.last_event_kind] || e.last_event_kind)} · ${fmtTime(e.last_event_ts)}</div></td>
+    </tr>`).join("");
+    $("rc-detail").innerHTML =
+      `<h2>${esc(r.id)} <span class="badge ACTIVE">${r.groups} 组 / ${r.headcount} 人</span></h2>
+       <table><tbody>
+        <tr><th>发起时间</th><td>${fmtTime(r.created_at)} · 版本 #${r.version}</td></tr>
+        <tr><th>发起人</th><td>${esc(r.created_by)}</td></tr>
+        <tr><th>原因</th><td>${esc(r.reason || "")}</td></tr>
+        <tr><th>范围</th><td>分区 ${esc(scope.zone_id || "全部")} · 批次 ${esc(scope.batch_id || "全部")}</td></tr>
+       </tbody></table>
+       <p class="hint">以下为发起瞬间冻结的在场名单（含同行人、批次分区、最后门点记录）；后续变化只写新快照，本内容永不改变。</p>
+       <table><thead><tr><th>票号</th><th>申请人/同行名单</th><th>整组</th><th>分区</th><th>批次</th><th>到场门点</th><th>最后门点记录</th></tr></thead>
+       <tbody>${rows || '<tr><td colspan=7 class=muted>快照内无在场人员</td></tr>'}</tbody></table>`;
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rc-view").onclick = () => loadRollcallDetail($("rc-list").value);
 
 // ---------------- 发票 ----------------
 $("btn-issue").onclick = async () => {
@@ -164,6 +314,11 @@ async function loadZones() {
     // 分区视图选择
     $("zv-zone").innerHTML = zones.map(z =>
       `<option value="${esc(z.id)}">${esc(z.id)} · ${esc(z.name)}</option>`).join("");
+    // 在场清册 / 应急清点的分区过滤
+    const zoneOpts = `<option value="">全部分区</option>` +
+      zones.map(z => `<option value="${esc(z.id)}">${esc(z.id)} · ${esc(z.name)}</option>`).join("");
+    if ($("pr-zone")) $("pr-zone").innerHTML = zoneOpts;
+    if ($("rc-zone")) $("rc-zone").innerHTML = zoneOpts;
   } catch (e) { /* 未填令牌时静默 */ }
 }
 window.deleteZone = async id => {
@@ -323,14 +478,17 @@ async function loadBatches() {
       : `<p class="muted">尚无批次。</p>`;
     $("bv-batch").innerHTML = batches.map(b =>
       `<option value="${esc(b.id)}">${esc(b.id)} · ${esc(b.visit_date)} · ${esc(b.zone_id)}</option>`).join("");
+    const batchOpts = `<option value="">全部批次</option>` +
+      batches.map(b => `<option value="${esc(b.id)}">${esc(b.id)} · ${esc(b.visit_date)}</option>`).join("");
+    if ($("pr-batch")) $("pr-batch").innerHTML = batchOpts;
+    if ($("rc-batch")) $("rc-batch").innerHTML = batchOpts;
   } catch (e) { /* 未填令牌时静默 */ }
 }
 
 window.selectBatch = async id => {
   $("bv-batch").value = id;
   document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("active", x.dataset.tab === "batch"));
-  ["batch", "person", "ticket", "zone", "events", "attempts"].forEach(t =>
-    $(`tab-${t}`).hidden = t !== "batch");
+  TAB_IDS.forEach(t => $(`tab-${t}`).hidden = t !== "batch");
   await loadBatchView();
 };
 $("btn-batchview").onclick = () => loadBatchView();
@@ -713,6 +871,8 @@ async function loadStats() {
       ["待审/候补", `${s.applications.PENDING} / ${s.applications.WAITLISTED}`, "#fcd34d"],
       ["已通过申请", s.applications.APPROVED, "#4ade80"],
       ["待审变更", (s.changes ? s.changes.PENDING : 0), "#fca5a5"],
+      ["在场（组/人）", `${s.onsite_groups} / ${s.onsite_people}`, "#4ade80"],
+      ["清点快照", s.rollcalls || 0, "#c4b5fd"],
     ].map(([k, v, c]) => `<div class="stat"><b style="color:${c}">${v}</b>${k}</div>`).join("");
     $("clock").textContent = "服务器时间 " + fmtTime(s.now);
   } catch (_) {}
@@ -720,9 +880,13 @@ async function loadStats() {
 
 function refreshAll() {
   loadStats();
-  loadZones().then(() => { loadGates(); loadZoneView(); loadBatches().then(loadBatchView); });
+  loadZones().then(() => {
+    loadGates(); loadZoneView();
+    loadBatches().then(() => { loadBatchView(); });
+  });
   loadRules();
   try { loadPeople(""); } catch (_) {}
+  try { loadPresence(); } catch (_) {}
   $("btn-events").click();
   $("btn-attempts").click();
 }

@@ -17,6 +17,18 @@ const setQueue = q => localStorage.setItem(queueKey(), JSON.stringify(q));
 const getHist = () => JSON.parse(localStorage.getItem(histKey()) || "[]");
 const setHist = h => localStorage.setItem(histKey(), JSON.stringify(h.slice(0, 50)));
 
+const MODE_LABEL = { in: "入场核销", out: "离场确认" };
+function mode() { return $("mode") ? $("mode").value : "in"; }
+function setModeBtn() {
+  const out = mode() === "out";
+  const btn = $("btn-redeem");
+  btn.textContent = out ? "确 认 离 场" : "核 销 入 场";
+  btn.classList.toggle("primary", !out);
+  btn.style.background = out ? "#0f7a5a" : "";
+  $("code").placeholder = out ? "T-XXXXXXXX（离场扫码）" : "T-XXXXXXXX";
+}
+$("mode") && ($("mode").onchange = setModeBtn);
+
 let syncing = false;
 let flushing = false;
 let online = false;
@@ -54,8 +66,8 @@ function renderHistory() {
   const h = getHist();
   $("history").innerHTML = h.map(x => `<tr>
     <td>${fmtTime(x.ts)}</td>
-    <td class="mono">${esc(x.code)}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人 · v${x.change_version ?? 0}</div>` : ""}</td>
-    <td><span class="badge ${x.ok ? "ok" : "fail"}">${x.ok ? "放行" : "拒绝"}</span></td>
+    <td class="mono">${esc(x.code)}${x.mode === "out" ? ' <span class="badge fail">离场</span>' : ""}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人 · v${x.change_version ?? 0}</div>` : ""}</td>
+    <td><span class="badge ${x.ok ? "ok" : "fail"}">${x.mode === "out" ? (x.ok ? "已离场" : "离场拒绝") : (x.ok ? "放行" : "拒绝")}</span></td>
     <td>${esc(x.detail || x.status || "")}${x.replayed ? " <span class='muted'>(幂等重放)</span>" : ""}</td>
   </tr>`).join("") || '<tr><td colspan=4 class="muted">暂无</td></tr>';
 }
@@ -64,11 +76,16 @@ function showResult(r, httpStatus, replayed) {
   const ok = r.ok;
   const detail = r.reason_text || r.status;
   const a = r.appointment;
+  const isDeparture = r.status === "DEPARTED";
+  const title = isDeparture
+    ? (ok ? "🚪 离场已确认" : "⚠ 离场未确认")
+    : (ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销");
   $("result").innerHTML = `<div class="result-box ${ok ? "ok" : "fail"}">
-    <div>${ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销"} ${httpStatus === 409 && r.reason === "already_redeemed" ? "（该票已使用）" : ""}</div>
+    <div>${title} ${httpStatus === 409 && r.reason === "already_redeemed" ? "（该票已使用）" : ""}</div>
     <div class="big-code">${esc(r.code || "")}</div>
     <div class="detail">
       ${r.person_id ? "持票人 " + esc(r.person_id) + " · " : ""}状态 ${esc(r.status)} · ${esc(detail)}
+      ${r.presence_status ? " · 在场状态 <b>" + esc(r.presence_status) + "</b>" : ""}
       ${a ? `<br>🏷️ 批次 <b>${esc(a.batch_id)}</b>${a.batch_name ? "（" + esc(a.batch_name) + "）" : ""}
              ${a.visit_date ? " · " + esc(a.visit_date) : ""}
              · 访客 <b>${esc(a.applicant_name || "")}</b>
@@ -79,6 +96,7 @@ function showResult(r, httpStatus, replayed) {
                : ""}
              ${a.replaced_code ? `<br>♻ 本票为变更后换发（替换旧票 <span class="mono">${esc(a.replaced_code)}</span>）：${esc(a.replacement_reason || "")}` : ""}
              ${a.replaced_by_code ? `<br>♻ 本票已因申请变更被替换，请改扫新票 <span class="mono">${esc(a.replaced_by_code)}</span>` : ""}` : ""}
+      ${r.departed_gate ? "<br>离场门点 <b>" + esc(r.departed_gate) + "</b> · 离场时间 " + fmtTime(r.departed_at) : ""}
       ${r.redeemed_gate ? "<br>已由门点 <b>" + esc(r.redeemed_gate) + "</b> 于 " + fmtTime(r.redeemed_at) + " 核销" : ""}
       ${r.revoked_reason ? "<br>作废原因：" + esc(r.revoked_reason) : ""}
       ${r.replaced_by_code && !a ? "<br>请改扫新票 <span class='mono'>" + esc(r.replaced_by_code) + "</span>" : ""}
@@ -90,11 +108,13 @@ function showResult(r, httpStatus, replayed) {
   </div>`;
 }
 
-async function doRedeem(code, attemptId) {
+async function doRedeem(code, attemptId, itemMode) {
+  const path = itemMode === "out" ? "/api/gate/departure" : "/api/gate/redeem";
+  const payload = itemMode === "out"
+    ? { gate_id: gateId(), code, attempt_id: attemptId }
+    : { gate_id: gateId(), code, attempt_id: attemptId, policy_version: getPV() };
   try {
-    const r = await gateApi("POST", "/api/gate/redeem", {
-      gate_id: gateId(), code, attempt_id: attemptId, policy_version: getPV(),
-    });
+    const r = await gateApi("POST", path, payload);
     return r; // fetch 非 2xx 会抛错
   } catch (e) {
     // 4xx 是服务器的明确业务结论（已使用/已作废/已过期/分区不符/封锁中等），同样是终态结果
@@ -112,7 +132,8 @@ async function scan() {
   const code = $("code").value.trim().toUpperCase();
   if (!code) return;
   $("code").value = "";
-  const item = { attempt_id: uuid(), code, ts: new Date().toISOString() };
+  const item = { attempt_id: uuid(), code, ts: new Date().toISOString(),
+                 mode: mode() };
   const queue = getQueue();
   queue.push(item);
   setQueue(queue);
@@ -129,7 +150,7 @@ async function flushQueue() {
   while (queue.length) {
     const item = queue[0]; // FIFO
     try {
-      const r = await doRedeem(item.code, item.attempt_id);
+      const r = await doRedeem(item.code, item.attempt_id, item.mode || "in");
       if (r.reason === "stale_policy") {
         // 规则版本过旧：不算终态结论，先按版本补齐策略事件再重试同一条
         if (++staleRetries > 3) {
@@ -153,6 +174,7 @@ async function flushQueue() {
         party_size: r.appointment ? r.appointment.party_size : null,
         applicant: r.appointment ? r.appointment.applicant_name : null,
         change_version: r.appointment ? r.appointment.change_version : null,
+        mode: item.mode || "in",
       });
       setHist(h);
       if (!r.replayed) showResult(r, r.ok ? 200 : (r.reason === "already_redeemed" ? 409 : 410), false);
@@ -184,7 +206,9 @@ async function sync() {
       for (const e of data.events) {
         const target = e.ticket_code
           ? ` ${e.ticket_code}`
-          : (e.application_id ? ` ${e.application_id}` + (e.batch_id ? ` @${e.batch_id}` : "") : (e.batch_id ? ` @${e.batch_id}` : ""));
+          : (e.application_id ? ` ${e.application_id}` + (e.batch_id ? ` @${e.batch_id}` : "")
+             : (e.rollcall_id ? ` 清点${e.rollcall_id}`
+                : (e.batch_id ? ` @${e.batch_id}` : "")));
         lines.push(`#${e.version} ${fmtTime(e.ts)} ${e.type}` +
           target +
           (e.gate_id ? ` @${e.gate_id}` : "") +
@@ -212,6 +236,7 @@ async function sync() {
 
 $("btn-redeem").onclick = scan;
 $("code").addEventListener("keydown", e => { if (e.key === "Enter") scan(); });
+setModeBtn();
 
 if (gateId()) {
   setNet(false, "正在连接…");

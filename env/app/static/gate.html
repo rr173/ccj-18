@@ -27,16 +27,22 @@
           </div>
         </div>
         <label style="margin-top:14px">票面编号（扫码枪/手输，回车提交）</label>
-        <input id="code" class="mono" style="font-size:18px;letter-spacing:1px"
-               placeholder="T-XXXXXXXX" autocomplete="off" autofocus>
-        <button class="btn primary big" id="btn-redeem" style="margin-top:12px;width:100%">核 销</button>
+        <div class="row">
+          <select id="mode" style="max-width:150px">
+            <option value="in">入场核销</option>
+            <option value="out">离场确认</option>
+          </select>
+          <input id="code" class="mono" style="font-size:18px;letter-spacing:1px;flex:1"
+                 placeholder="T-XXXXXXXX" autocomplete="off" autofocus>
+        </div>
+        <button class="btn primary big" id="btn-redeem" style="margin-top:12px;width:100%">核 销 入 场</button>
 
         <div id="result"></div>
 
         <div class="section">
           <div class="muted" style="font-size:12px">
             离线待补提交：<b id="queue-n">0</b> 条 ·
-            后台每 5 秒按版本号补齐撤销/核销/过期与封锁规则
+            后台每 5 秒按版本号补齐撤销/核销/到场/离场/更正/清点与封锁规则
           </div>
         </div>
       </div>

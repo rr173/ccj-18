@@ -18,6 +18,7 @@ from .db import (
     utcnow,
     write_tx,
 )
+from . import presence as presence_svc
 
 # Crockford base32，去掉了易混淆的 I/L/O/U
 _CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -735,6 +736,22 @@ def redeem(
                                     "valid_until": ticket["valid_until"],
                                     "reason_text": REASON_TEXT["ok"],
                                 }
+                                # 核销成功即在同一事务登记到场（申请人+同行
+                                # 人数当场冻结）。已 DEPARTED/REMOVED 的票不
+                                # 自动复活，只在响应里标注当前在场状态。
+                                arrival_version = presence_svc.register_arrival_locked(
+                                    conn,
+                                    ticket=ticket,
+                                    gate_id=gate_id,
+                                    attempt_id=attempt_id,
+                                    now=now,
+                                    policy_version=policy_now,
+                                )
+                                pres = presence_svc.get_presence(conn, code)
+                                response["presence_status"] = (
+                                    pres["status"] if pres else "ARRIVED")
+                                if arrival_version is not None:
+                                    response["arrival_version"] = arrival_version
                                 appt = appointment_info(conn, code)
                                 if appt:
                                     response["appointment"] = appt
@@ -2285,6 +2302,20 @@ def batch_detail(conn: sqlite3.Connection, batch_id: str) -> Optional[dict]:
             "SELECT * FROM events WHERE batch_id=? ORDER BY id", (batch_id,)
         ).fetchall()
     ]
+    # 在场清册：本批次当前在场 / 已离场 / 误扫移除分组计数与逐组状态
+    presence_rows = [
+        presence_svc.presence_dict(r) for r in conn.execute(
+            "SELECT * FROM presence WHERE batch_id=? ORDER BY arrived_at",
+            (batch_id,),
+        ).fetchall()
+    ]
+    presence_summary = {
+        "onsite": [p for p in presence_rows if p["status"] == "ARRIVED"],
+        "departed": [p for p in presence_rows if p["status"] == "DEPARTED"],
+        "removed": [p for p in presence_rows if p["status"] == "REMOVED"],
+        "onsite_people": sum(
+            p["party_size"] for p in presence_rows if p["status"] == "ARRIVED"),
+    }
     return {
         "batch": batch_dict(
             batch, used=_used_seats(conn, batch_id),
@@ -2297,6 +2328,7 @@ def batch_detail(conn: sqlite3.Connection, batch_id: str) -> Optional[dict]:
         "pending_changes": list_changes(conn, batch_id=batch_id, status="PENDING"),
         "capacity_log": capacity_log(conn, batch_id),
         "events": events,
+        "presence": presence_summary,
         "now": now,
     }
 
@@ -2474,7 +2506,29 @@ def get_person_view(conn: sqlite3.Connection, person_id: str) -> Optional[dict]:
         "events": events,
         "scan_attempts": attempts,
         "gates": gates,
+        "presence": _person_presence(conn, person_id, codes),
     }
+
+
+def _person_presence(
+    conn: sqlite3.Connection, person_id: str, codes: list[str]
+) -> list[dict]:
+    """人员视图：每张票的当前在场状态与轨迹（含人工更正与操作者）。"""
+    out = []
+    rows = conn.execute(
+        "SELECT * FROM presence WHERE person_id=? ORDER BY arrived_at DESC",
+        (person_id,),
+    ).fetchall()
+    for r in rows:
+        d = presence_svc.presence_dict(r)
+        d["trail"] = [
+            presence_svc.presence_event_dict(t) for t in conn.execute(
+                "SELECT * FROM presence_events WHERE ticket_code=? ORDER BY seq",
+                (r["ticket_code"],),
+            ).fetchall()
+        ]
+        out.append(d)
+    return out
 
 
 def list_people(conn: sqlite3.Connection, q: Optional[str] = None, limit: int = 100) -> list[dict]:
@@ -2599,6 +2653,10 @@ def stats(conn: sqlite3.Connection) -> dict:
         ).fetchone()["c"]
         for s in ("PENDING", "APPROVED", "REJECTED", "CANCELLED", "EXPIRED")
     }
+    onsite = conn.execute(
+        "SELECT COUNT(*) c, COALESCE(SUM(party_size),0) p FROM presence "
+        "WHERE status='ARRIVED'"
+    ).fetchone()
     return {
         "now": now_str,
         "tickets": counts,
@@ -2617,4 +2675,9 @@ def stats(conn: sqlite3.Connection) -> dict:
         "batches_open": batches_open,
         "applications": apps_counts,
         "changes": changes_counts,
+        "onsite_groups": onsite["c"],
+        "onsite_people": int(onsite["p"]),
+        "rollcalls": conn.execute(
+            "SELECT COUNT(*) c FROM rollcalls"
+        ).fetchone()["c"],
     }
