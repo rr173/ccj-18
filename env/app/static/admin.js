@@ -17,8 +17,8 @@ $("saveToken").onclick = () => {
 };
 
 // ---------------- Tabs ----------------
-const TAB_IDS = ["presence", "rollcall", "batch", "person", "ticket", "zone",
-                 "events", "attempts"];
+const TAB_IDS = ["routes", "presence", "rollcall", "batch", "person", "ticket",
+                 "zone", "events", "attempts"];
 document.querySelectorAll(".tabs button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
@@ -28,6 +28,7 @@ document.querySelectorAll(".tabs button").forEach(btn => {
     if (btn.dataset.tab === "batch") loadBatchView();
     if (btn.dataset.tab === "presence") loadPresence();
     if (btn.dataset.tab === "rollcall") loadRollcallList();
+    if (btn.dataset.tab === "routes") { loadRouteMonitor(); loadRouteConflicts(); }
   };
 });
 
@@ -189,6 +190,7 @@ $("btn-issue").onclick = async () => {
     const zones = [...document.querySelectorAll("#f-zones input[type=checkbox]:checked")]
       .map(cb => cb.value);
     const payload = { person_id: person, ttl_seconds: minutes * 60, zones };
+    if ($("f-route").value) payload.route_id = $("f-route").value;
     if ($("f-from").value) {
       delete payload.ttl_seconds;
       payload.valid_from = new Date($("f-from").value).toISOString();
@@ -199,7 +201,8 @@ $("btn-issue").onclick = async () => {
     $("issue-result").innerHTML =
       `<div class="result-box ok">已签发 <span class="big-code mono">${esc(t.code)}</span>
        <div class="detail">有效期至 ${fmtTime(t.valid_until)} · 版本 #${t.version}<br>
-       允许分区：${t.zones && t.zones.length ? t.zones.map(esc).join("、") : "（无 · 所有门点拒绝）"}</div></div>`;
+       允许分区：${t.zones && t.zones.length ? t.zones.map(esc).join("、") : "（无 · 所有门点拒绝）"}<br>
+	       ${t.route_id ? `检查路线：<b>${esc(t.route_id)}</b> v${t.route_version}（首次核销须在入口检查点）` : ""}</div></div>`;
     toast("发票成功", "success");
     refreshAll();
   } catch (e) { toast("发票失败：" + e.message, "error"); }
@@ -439,13 +442,15 @@ $("btn-batch").onclick = async () => {
     if (!visit_date) return toast("请选择访问日期", "error");
     if (!$("b-start").value || !$("b-end").value) return toast("请选择时段", "error");
     if (!capacity || capacity < 1) return toast("人数上限无效", "error");
-    const b = await adminApi("POST", "/api/admin/batches", {
+    const body = {
       name: $("b-name").value.trim() || null,
       visit_date,
       start_at: new Date($("b-start").value).toISOString(),
       end_at: new Date($("b-end").value).toISOString(),
       zone_id, capacity,
-    });
+    };
+    if ($("b-route").value) body.route_id = $("b-route").value;
+    const b = await adminApi("POST", "/api/admin/batches", body);
     const link = `${location.origin}/apply?k=${encodeURIComponent(b.apply_token)}`;
     toast("批次已创建：" + b.id, "success");
     $("b-name").value = "";
@@ -873,6 +878,11 @@ async function loadStats() {
       ["待审变更", (s.changes ? s.changes.PENDING : 0), "#fca5a5"],
       ["在场（组/人）", `${s.onsite_groups} / ${s.onsite_people}`, "#4ade80"],
       ["清点快照", s.rollcalls || 0, "#c4b5fd"],
+      ["路线（进行/完成/违规）",
+        `${s.route_in_progress || 0} / ${s.route_completed || 0} / ${s.route_violated || 0}`,
+        s.route_violated ? "#fca5a5" : "#93c5fd"],
+      ["路线冲突待处理", s.route_open_conflicts || 0,
+        s.route_open_conflicts ? "#fca5a5" : "#cbd5e1"],
     ].map(([k, v, c]) => `<div class="stat"><b style="color:${c}">${v}</b>${k}</div>`).join("");
     $("clock").textContent = "服务器时间 " + fmtTime(s.now);
   } catch (_) {}
@@ -885,6 +895,7 @@ function refreshAll() {
     loadBatches().then(() => { loadBatchView(); });
   });
   loadRules();
+  try { if (token) { loadRouteCatalog(); loadRouteMonitor(); loadRouteConflicts(); } } catch (_) {}
   try { loadPeople(""); } catch (_) {}
   try { loadPresence(); } catch (_) {}
   $("btn-events").click();
@@ -893,4 +904,344 @@ function refreshAll() {
 
 setInterval(loadStats, 5000);
 setInterval(() => { if (!$("tab-events").hidden) $("btn-events").click(); }, 8000);
+setInterval(() => { if (!$("tab-routes").hidden) { loadRouteMonitor(); loadRouteConflicts(); } }, 5000);
 if (token) refreshAll();
+
+// ================= 访客路线：编排 + 监控 =================
+
+const ROUTE_STATUS_BADGE = {
+  IN_PROGRESS: "ACTIVE", COMPLETED: "REDEEMED", VIOLATED: "REVOKED",
+};
+const ROUTE_STATUS_TEXT = {
+  IN_PROGRESS: "进行中", COMPLETED: "已完成", VIOLATED: "已违规",
+};
+const VIOLATION_TEXT = {
+  SKIPPED_CHECKPOINT: "跳过检查点",
+  CHECKPOINT_CLOSED: "进入已关闭检查点",
+  DWELL_TIMEOUT: "停留超时",
+  ADMIN_MARK_VIOLATED: "管理员判定违规",
+};
+const CONFLICT_TEXT = {
+  GAP_PENDING: "中间检查点缺失",
+  LATE_EVENT: "迟到的旧事件",
+  ALREADY_TERMINAL: "终态后到达",
+  INVALID_TIMESTAMP: "事件时间异常",
+  NO_ROUTE: "路线未开始/未绑定",
+  TICKET_STATE: "票面状态异常",
+};
+
+let rtvCheckpoints = [];
+
+async function loadRouteCatalog() {
+  try {
+    requireToken();
+    const [{ routes }, { gates }, { zones }, { batches }] = await Promise.all([
+      adminApi("GET", "/api/admin/routes"),
+      adminApi("GET", "/api/admin/gates"),
+      adminApi("GET", "/api/admin/zones"),
+      adminApi("GET", "/api/admin/batches"),
+    ]);
+    window._routeCatalog = routes;
+    // 编排卡：分区下拉
+    $("rt-zone").innerHTML = zones.zones.length
+      ? zones.zones.map(z => `<option value="${esc(z.id)}">${esc(z.id)} · ${esc(z.name)}</option>`).join("")
+      : '<option value="">（先建分区）</option>';
+    // 路线选择下拉
+    const routeOpts = '<option value="">选择路线…</option>' + routes.filter(r => !r.paused).map(r =>
+      `<option value="${esc(r.id)}">${esc(r.id)} v${r.current_version} · ${esc(r.name)}</option>`).join("");
+    const routeOptsAll = '<option value="">不绑定路线</option>' + routes.map(r =>
+      `<option value="${esc(r.id)}">${esc(r.id)} v${r.current_version} · ${esc(r.name)}`
+      + `${r.paused ? "（已暂停）" : ""}</option>`).join("");
+    $("f-route").innerHTML = routeOptsAll;
+    $("b-route").innerHTML = routeOptsAll;
+    for (const id of ["rtv-route", "rta-route", "rm-route"]) $(id).innerHTML = routeOpts;
+    $("rm-zone").innerHTML = '<option value="">全部分区</option>' +
+      zones.zones.map(z => `<option value="${esc(z.id)}">${esc(z.id)}</option>`).join("");
+    $("rm-batch").innerHTML = '<option value="">全部批次</option>' +
+      (batches.batches || []).map(x =>
+        `<option value="${esc(x.id)}">${esc(x.id)}${x.name ? " · " + esc(x.name) : ""}</option>`).join("");
+    renderRouteList(routes);
+    renderCheckpointEditor(gates.gates);
+    return { routes, gates: gates.gates };
+  } catch (e) { toast(e.message, "error"); return { routes: [], gates: [] }; }
+}
+
+function renderRouteList(routes) {
+  $("rt-list").innerHTML = routes.length ? `<table><thead><tr>
+    <th>路线</th><th>分区</th><th>版本</th><th>状态</th><th>检查点</th>
+    <th>进行/完成/违规</th><th></th></tr></thead><tbody>` +
+    routes.map(r => `<tr>
+      <td class="mono">${esc(r.id)}<div class="muted" style="font-size:11px">${esc(r.name)}</div></td>
+      <td>${esc(r.zone_id)}</td>
+      <td>v${r.current_version}</td>
+      <td>${r.paused ? '<span class="badge LOCKED">已暂停</span>' : '<span class="badge ACTIVE">使用中</span>'}</td>
+      <td>${r.checkpoint_count}</td>
+      <td>${r.in_progress} / ${r.completed} / <b style="color:${r.violated ? "#fca5a5" : ""}">${r.violated}</b></td>
+      <td><button class="btn small" onclick="showRouteDetail('${esc(r.id)}')">查看</button></td>
+    </tr>`).join("") + "</tbody></table>"
+    : '<p class="muted">尚未编排路线。</p>';
+}
+
+function renderCheckpointEditor(gates) {
+  const wrap = $("rtv-cps");
+  if (!rtvCheckpoints.length) rtvCheckpoints = [{ gate_id: "", max_stay_seconds: "" }];
+  const opts = '<option value="">选择门点…</option>' + gates.map(g =>
+    `<option value="${esc(g.id)}">${esc(g.id)} · ${esc(g.name)}（${esc(g.zone_id || "未配置分区")}）</option>`).join("");
+  wrap.innerHTML = rtvCheckpoints.map((cp, i) => `<div class="row" style="margin-bottom:6px">
+    <b style="min-width:24px">#${i + 1}</b>
+    <select data-i="${i}" class="rtv-gate" style="flex:1">${
+      opts.replace(`value="${esc(cp.gate_id)}"`, `value="${esc(cp.gate_id)}" selected`)
+    }</select>
+    <input data-i="${i}" class="rtv-stay" type="number" min="1" placeholder="最长停留秒(空=不限)"
+           style="max-width:170px" value="${cp.max_stay_seconds ?? ""}">
+    <button class="btn small danger" data-i="${i}" data-act="del">删</button>
+  </div>`).join("");
+  wrap.querySelectorAll(".rtv-gate").forEach(sel =>
+    sel.onchange = () => { rtvCheckpoints[+sel.dataset.i].gate_id = sel.value; });
+  wrap.querySelectorAll(".rtv-stay").forEach(inp =>
+    inp.oninput = () => { rtvCheckpoints[+inp.dataset.i].max_stay_seconds = inp.value; });
+  wrap.querySelectorAll("[data-act=del]").forEach(btn =>
+    btn.onclick = () => {
+      rtvCheckpoints.splice(+btn.dataset.i, 1);
+      renderCheckpointEditor(gates);
+    });
+}
+
+$("btn-route-create").onclick = async () => {
+  try {
+    requireToken();
+    const body = {
+      zone_id: $("rt-zone").value,
+      name: $("rt-name").value.trim() || ("路线-" + Date.now()),
+    };
+    if ($("rt-id").value.trim()) body.id = $("rt-id").value.trim();
+    const r = await adminApi("POST", "/api/admin/routes", body);
+    toast(`路线已创建：${r.id}（请发布检查点版本）`, "success");
+    $("rtv-route").value = r.id;
+    await loadRouteCatalog();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rtv-add").onclick = async () => {
+  const { gates } = await loadRouteCatalog();
+  rtvCheckpoints.push({ gate_id: "", max_stay_seconds: "" });
+  renderCheckpointEditor(gates);
+};
+
+$("btn-rtv-publish").onclick = async () => {
+  try {
+    requireToken();
+    const rid = $("rtv-route").value;
+    if (!rid) return toast("请选择路线", "error");
+    const gates = [...document.querySelectorAll("#rtv-cps .rtv-gate")].map(s => s.value);
+    const stays = [...document.querySelectorAll("#rtv-cps .rtv-stay")].map(s => s.value);
+    if (gates.some(g => !g)) return toast("每个检查点都要选择门点", "error");
+    const checkpoints = gates.map((g, i) => ({
+      gate_id: g,
+      name: `检查点 ${i + 1}`,
+      ...(stays[i] ? { max_stay_seconds: parseInt(stays[i], 10) } : {}),
+    }));
+    const r = await adminApi("POST", `/api/admin/routes/${rid}/versions`,
+      { checkpoints, note: $("rtv-note").value.trim() || null });
+    toast(`已发布 ${rid} v${r.published_version}（仅影响之后开始的访客）`, "success");
+    rtvCheckpoints = [];
+    await loadRouteCatalog();
+    showRouteDetail(rid);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+window.showRouteDetail = async rid => {
+  try {
+    const d = await adminApi("GET", `/api/admin/routes/${rid}`);
+    const versions = d.versions.map(v => `<details><summary>v${v.version} · ${v.checkpoints.length} 点 · ${fmtTime(v.created_at)}</summary>
+      <table><thead><tr><th>#</th><th>门点</th><th>名称</th><th>最长停留</th><th>状态</th></tr></thead><tbody>
+      ${v.checkpoints.map(c => `<tr><td>${c.seq}</td><td class="mono">${esc(c.gate_id)}</td>
+        <td>${esc(c.name)}</td><td>${c.max_stay_seconds ? c.max_stay_seconds + " 秒" : "不限"}</td>
+        <td>${c.closed ? '<span class="badge LOCKED">已关闭</span>' : '<span class="badge ACTIVE">开放</span>'}</td></tr>`).join("")}
+      </tbody></table></details>`).join("");
+    $("rtv-result").innerHTML =
+      `<h2>${esc(rid)} <span class="badge ${d.route.status === "PAUSED" ? "LOCKED" : "ACTIVE"}">`
+      + `${d.route.status === "PAUSED" ? "已暂停" : "使用中"}</span> v${d.route.current_version}</h2>
+       <p class="hint">目录版本 #${d.catalog_version} · 绑定 ${d.bindings.length} 次 · 执行 ${d.progress.length} 条</p>
+       ${versions}`;
+    $("rta-route").value = rid; $("rtv-route").value = rid;
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rta-close").onclick = async () => {
+  const r = await routeCheckpointState(true);
+  if (r) toast(`检查点 #${r.checkpoint.seq} 已关闭（在途访客进入即判违规）`, "success");
+};
+$("btn-rta-open").onclick = async () => {
+  const r = await routeCheckpointState(false);
+  if (r) toast(`检查点 #${r.checkpoint.seq} 已开放`, "success");
+};
+async function routeCheckpointState(closed) {
+  try {
+    requireToken();
+    const rid = $("rta-route").value;
+    const seq = parseInt($("rta-seq").value, 10);
+    if (!rid || !seq) { toast("请选择路线并填写检查点顺序", "error"); return null; }
+    const body = { seq, closed };
+    const v = parseInt($("rta-version").value, 10);
+    if (v) body.version = v;
+    const r = await adminApi("PUT", `/api/admin/routes/${rid}/checkpoints`, body);
+    await loadRouteCatalog();
+    return r;
+  } catch (e) { toast(e.message, "error"); return null; }
+}
+
+$("btn-rta-pause").onclick = async () => {
+  try {
+    requireToken();
+    const rid = $("rta-route").value;
+    if (!rid) return toast("请选择路线", "error");
+    await adminApi("POST", `/api/admin/routes/${rid}/pause`, { reason: "admin" });
+    toast("路线已暂停：不再接受新的绑定/开始；在途访客继续走原版本", "success");
+    await loadRouteCatalog();
+  } catch (e) { toast(e.message, "error"); }
+};
+$("btn-rta-resume").onclick = async () => {
+  try {
+    requireToken();
+    const rid = $("rta-route").value;
+    if (!rid) return toast("请选择路线", "error");
+    await adminApi("POST", `/api/admin/routes/${rid}/resume`, { reason: "admin" });
+    toast("路线已恢复", "success");
+    await loadRouteCatalog();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rta-bind").onclick = async () => {
+  try {
+    requireToken();
+    const rid = $("rta-route").value;
+    const target = $("rta-target").value.trim();
+    const scope = $("rta-scope").value;
+    if (!rid || !target) return toast("请选择路线并填写票号/批次", "error");
+    const body = { route_id: rid, scope };
+    body[scope === "TICKET" ? "code" : "batch_id"] = target;
+    const r = await adminApi("POST", "/api/admin/routes/bindings", body);
+    toast(`已把 ${scope === "TICKET" ? r.ticket_code : r.batch_id} 绑定到 ${rid} v${r.route_version}`, "success");
+    await loadRouteCatalog();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+// ---------------- 路线监控 ----------------
+
+async function loadRouteMonitor() {
+  try {
+    requireToken();
+    const params = new URLSearchParams();
+    if ($("rm-status").value) params.set("status", $("rm-status").value);
+    if ($("rm-route").value) params.set("route_id", $("rm-route").value);
+    if ($("rm-zone").value) params.set("zone_id", $("rm-zone").value);
+    if ($("rm-batch").value) params.set("batch_id", $("rm-batch").value);
+    if ($("rm-person").value.trim()) params.set("person_id", $("rm-person").value.trim());
+    if ($("rm-overdue").checked) params.set("overdue", "true");
+    const [v, summ] = await Promise.all([
+      adminApi("GET", "/api/admin/route-progress?" + params.toString()),
+      adminApi("GET", "/api/admin/routes"),
+    ]);
+    const s = summ.summary;
+    $("rt-summary").innerHTML = [
+      ["进行中", s.in_progress, "#93c5fd"],
+      ["已完成", s.completed, "#4ade80"],
+      ["违规", s.violated, "#fca5a5"],
+      ["超时停留", s.overdue, "#fcd34d"],
+      ["待处理冲突", s.open_conflicts, s.open_conflicts ? "#fca5a5" : "#cbd5e1"],
+    ].map(([k, val, c]) => `<div class="stat"><b style="color:${c}">${val}</b>${k}</div>`).join("");
+    $("rm-list").innerHTML = v.progress.length ? `<table><thead><tr>
+      <th>票号</th><th>人员</th><th>路线/版本</th><th>状态</th><th>当前检查点</th>
+      <th>停留</th><th>批次</th><th></th></tr></thead><tbody>` +
+      v.progress.map(p => {
+        const cp = p.current_checkpoint;
+        const dwell = p.dwell_seconds != null
+          ? `${p.dwell_seconds}s${cp && cp.max_stay_seconds ? " / " + cp.max_stay_seconds + "s" : ""}`
+          : "—";
+        return `<tr>
+        <td class="mono code-cell">${esc(p.ticket_code)}</td>
+        <td>${esc(p.applicant_name || p.person_id)}</td>
+        <td class="mono">${esc(p.route_id)}<div class=muted>v${p.route_version}</div></td>
+        <td><span class="badge ${ROUTE_STATUS_BADGE[p.status]}">${ROUTE_STATUS_TEXT[p.status] || p.status}</span>
+            ${p.violation_kind ? `<div class="muted" style="font-size:11px">${esc(VIOLATION_TEXT[p.violation_kind] || p.violation_kind)}</div>` : ""}</td>
+        <td>${cp ? `#${cp.seq} ${esc(cp.name || cp.gate_id)}` : "—"}
+            ${cp && cp.closed ? ' <span class="badge LOCKED">关闭</span>' : ""}</td>
+        <td>${dwell}${p.overdue ? ' <span class="badge fail">超时</span>' : ""}</td>
+        <td class="muted">${esc(p.batch_id || "")}</td>
+        <td><button class="btn small" onclick="loadProgressDetail('${esc(p.ticket_code)}')">轨迹</button></td>
+      </tr>`;
+      }).join("") + "</tbody></table>"
+      : '<p class="muted">无符合条件的路线执行。</p>';
+  } catch (e) { /* 静默：定时刷新时令牌可能为空 */ }
+}
+
+window.loadProgressDetail = async code => {
+  try {
+    const d = await adminApi("GET", `/api/admin/route-progress/${encodeURIComponent(code)}`);
+    const p = d.progress;
+    const cpRows = (d.checkpoints || []).map(c => {
+      const reached = p && c.seq <= (p.status === "COMPLETED" ? d.checkpoints.length : (p.current_seq || 0));
+      return `<tr><td>#${c.seq}</td><td class="mono">${esc(c.gate_id)} ${c.gate_name ? esc(c.gate_name) : ""}</td>
+        <td>${esc(c.name)}</td><td>${c.max_stay_seconds ? c.max_stay_seconds + " 秒" : "不限"}</td>
+        <td>${c.closed ? '<span class="badge LOCKED">关闭</span>' : "开放"}</td>
+        <td>${reached ? "✅" : ""}</td></tr>`;
+    }).join("");
+    const checkRows = (d.checks || []).map(x => `<tr>
+      <td>${fmtTime(x.at)}</td><td class="mono">${esc(x.gate_id)}</td>
+      <td>${x.checkpoint_seq ?? "—"}</td>
+      <td><span class="badge ${x.decision === "REJECTED" || x.decision === "VIOLATED" || x.decision === "CONFLICT" ? "fail" : "ok"}">${esc(x.decision)}</span></td>
+      <td>${esc(x.result || "")}${x.reason ? " · " + esc(x.reason) : ""}</td>
+      <td>${x.offline ? "离线" : ""}${x.replayed ? "重放" : ""}</td></tr>`).join("");
+    $("rm-detail").innerHTML =
+      `<h2>${esc(code)} ${p ? `<span class="badge ${ROUTE_STATUS_BADGE[p.status]}">${ROUTE_STATUS_TEXT[p.status] || p.status}</span>` : '<span class=muted>未开始</span>'}</h2>
+       ${p && p.violation_kind ? `<p class="hint">违规：<b>${esc(VIOLATION_TEXT[p.violation_kind] || p.violation_kind)}</b>${p.violation_reason ? " · " + esc(p.violation_reason) : ""}</p>` : ""}
+       <table><thead><tr><th>#</th><th>门点</th><th>名称</th><th>最长停留</th><th>状态</th><th>已到</th></tr></thead>
+       <tbody>${cpRows}</tbody></table>
+       <div class="section"><h2>门点检查记录（票/人员/版本/顺序/门点）</h2>
+       <table><thead><tr><th>时间</th><th>门点</th><th>检查点</th><th>结论</th><th>原因</th><th>标记</th></tr></thead>
+       <tbody>${checkRows || '<tr><td colspan=6 class=muted>无</td></tr>'}</tbody></table></div>`;
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rm").onclick = () => { try { requireToken(); loadRouteMonitor(); } catch (_) {} };
+
+// ---------------- 离线冲突队列 ----------------
+
+async function loadRouteConflicts() {
+  try {
+    requireToken();
+    const status = $("rc-status").value;
+    const { conflicts } = await adminApi("GET",
+      `/api/admin/route-conflicts?status=${encodeURIComponent(status)}`);
+    $("rc-list").innerHTML = conflicts.length ? conflicts.map(c => `<div class="section" style="border:1px solid #334155;padding:10px">
+      <div><b>#${c.id}</b> <span class="badge fail">${esc(CONFLICT_TEXT[c.kind] || c.kind)}</span>
+        <span class="badge ${c.status === "OPEN" ? "LOCKED" : ""}">${c.status === "OPEN" ? "待处理" : "已处理 · " + esc(c.resolution || "")}</span></div>
+      <div class="muted" style="font-size:12px;margin:4px 0">
+        票 <span class="mono">${esc(c.ticket_code)}</span> · 门点 ${esc(c.gate_id)} ·
+        检查点 #${c.checkpoint_seq ?? "—"} · 路线 ${esc(c.route_id || "")} v${c.route_version ?? "—"}<br>
+        事件时间 ${fmtTime(c.event_ts)} · 发现于 ${fmtTime(c.detected_at)}
+        ${c.resolve_reason ? "<br>处理原因：" + esc(c.resolve_reason) + "（" + esc(c.resolved_by || "") + "）" : ""}
+      </div>
+      ${c.status === "OPEN" ? `<div class="row">
+        <button class="btn primary small" onclick="resolveConflict(${c.id},'APPLIED')">按现场补推进</button>
+        <button class="btn danger small" onclick="resolveConflict(${c.id},'MARK_VIOLATED')">判违规</button>
+        <button class="btn small" onclick="resolveConflict(${c.id},'DISMISSED')">忽略</button>
+      </div>` : ""}
+    </div>`).join("") : '<p class="muted">无冲突记录。</p>';
+  } catch (_) {}
+}
+
+window.resolveConflict = async (id, action) => {
+  const reason = prompt(`处理冲突 #${id}（${action}）的原因：`, action === "DISMISSED" ? "确认忽略" : "管理员处理");
+  if (reason === null) return;
+  try {
+    await adminApi("POST", `/api/admin/route-conflicts/${id}/resolve`,
+      { action, reason: reason || "admin" });
+    toast(`冲突 #${id} 已处理（${action}），原始冲突记录保留`, "success");
+    await Promise.all([loadRouteConflicts(), loadRouteMonitor(), loadStats()]);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("btn-rc").onclick = () => { try { requireToken(); loadRouteConflicts(); } catch (_) {} };
+

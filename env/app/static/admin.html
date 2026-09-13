@@ -44,6 +44,8 @@
         <input id="f-note" placeholder="可选">
         <label>允许通行的分区（不勾选 = 所有门点拒绝）</label>
         <div id="f-zones" class="zone-box"><span class="muted">加载中…</span></div>
+        <label>绑定检查路线（可选；绑定时分区须包含路线所属分区）</label>
+        <select id="f-route"><option value="">不绑定路线</option></select>
         <button class="btn primary" id="btn-issue" style="margin-top:12px;width:100%">发票</button>
         <div id="issue-result"></div>
       </div>
@@ -74,6 +76,8 @@
         </div>
         <label>所属分区（审核通过后签发的票仅允许该分区）</label>
         <select id="b-zone"></select>
+        <label>绑定检查路线（可选；审核签票时固化当前版本）</label>
+        <select id="b-route"><option value="">不绑定路线</option></select>
         <button class="btn primary" id="btn-batch" style="margin-top:12px;width:100%">创建批次</button>
         <div class="section" id="batches"></div>
       </div>
@@ -85,6 +89,56 @@
         <label>作废原因</label>
         <input id="r-reason" value="admin_revoke">
         <button class="btn danger" id="btn-revoke" style="margin-top:12px;width:100%">作废该票（其他票不受影响）</button>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>访客路线编排</h2>
+        <div class="row">
+          <input id="rt-id" placeholder="路线 ID（留空自动）">
+          <input id="rt-name" placeholder="路线名称，如 供应商参观线">
+          <select id="rt-zone"></select>
+        </div>
+        <button class="btn primary" id="btn-route-create" style="margin-top:8px;width:100%">创建路线</button>
+        <div class="section" id="rt-list"></div>
+
+        <h2 style="margin-top:18px">发布新版本（替换未来使用）</h2>
+        <div class="row">
+          <select id="rtv-route" style="flex:1"><option value="">选择路线…</option></select>
+        </div>
+        <div class="muted" style="font-size:12px;margin:6px 0">
+          按顺序添加检查点（门点 + 该点最长停留秒数，留空=不限）；发布后版本内容不可变，在途访客继续走旧版本。
+        </div>
+        <div id="rtv-cps"></div>
+        <div class="row">
+          <button class="btn" id="btn-rtv-add" type="button">+ 检查点</button>
+          <input id="rtv-note" placeholder="版本说明（可选）" style="flex:1">
+        </div>
+        <button class="btn primary" id="btn-rtv-publish" style="margin-top:8px;width:100%">发布新版本</button>
+        <div id="rtv-result" class="section"></div>
+
+        <h2 style="margin-top:18px">检查点开/闭 · 暂停/恢复 · 绑定</h2>
+        <div class="row">
+          <select id="rta-route" style="flex:1"><option value="">路线…</option></select>
+        </div>
+        <div class="row">
+          <input id="rta-seq" type="number" min="1" placeholder="检查点顺序#" style="max-width:130px">
+          <input id="rta-version" type="number" min="1" placeholder="版本(默认当前)" style="max-width:130px">
+          <button class="btn danger" id="btn-rta-close">关闭</button>
+          <button class="btn" id="btn-rta-open">打开</button>
+        </div>
+        <div class="row">
+          <button class="btn danger" id="btn-rta-pause">暂停路线</button>
+          <button class="btn primary" id="btn-rta-resume">恢复路线</button>
+        </div>
+        <div class="row">
+          <select id="rta-scope">
+            <option value="TICKET">绑定到票</option>
+            <option value="BATCH">绑定到批次</option>
+          </select>
+          <input id="rta-target" placeholder="票面编号 或 批次 ID" style="flex:1">
+          <button class="btn primary" id="btn-rta-bind">绑定</button>
+        </div>
+        <div id="rta-result" class="section"></div>
       </div>
 
       <div class="card" style="margin-top:16px">
@@ -127,7 +181,8 @@
     <div>
       <div class="card">
         <div class="tabs">
-          <button data-tab="presence" class="btn active">在场清册</button>
+          <button data-tab="routes" class="btn active">路线监控</button>
+          <button data-tab="presence" class="btn">在场清册</button>
           <button data-tab="rollcall" class="btn">应急清点</button>
           <button data-tab="batch" class="btn">预约批次</button>
           <button data-tab="person" class="btn">按人查看</button>
@@ -137,7 +192,39 @@
           <button data-tab="attempts" class="btn">门点记录</button>
         </div>
 
-        <div id="tab-presence">
+        <div id="tab-routes">
+          <div class="pill-row" id="rt-summary"></div>
+          <div class="row">
+            <select id="rm-status">
+              <option value="">全部执行</option>
+              <option value="IN_PROGRESS" selected>进行中</option>
+              <option value="COMPLETED">已完成</option>
+              <option value="VIOLATED">违规历史</option>
+            </select>
+            <select id="rm-route"><option value="">全部路线</option></select>
+            <select id="rm-zone"><option value="">全部分区</option></select>
+          </div>
+          <div class="row">
+            <select id="rm-batch"><option value="">全部批次</option></select>
+            <input id="rm-person" placeholder="按人员标识过滤" style="max-width:160px">
+            <label style="font-size:12px"><input type="checkbox" id="rm-overdue"> 仅超时停留</label>
+            <button class="btn primary" id="btn-rm">刷新</button>
+          </div>
+          <div class="section" id="rm-list"></div>
+          <div class="section" id="rm-detail"></div>
+          <h2>离线冲突队列（需管理员处理）</h2>
+          <div class="row">
+            <select id="rc-status">
+              <option value="OPEN" selected>待处理</option>
+              <option value="ALL">全部</option>
+              <option value="RESOLVED">已处理</option>
+            </select>
+            <button class="btn primary" id="btn-rc">刷新冲突</button>
+          </div>
+          <div class="section" id="rc-list"></div>
+        </div>
+
+        <div id="tab-presence" hidden>
           <div class="row">
             <select id="pr-view">
               <option value="onsite">当前在场</option>

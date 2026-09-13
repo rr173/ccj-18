@@ -16,7 +16,7 @@
   原始轨迹与操作者保留；应急清点生成**不可变快照**（在场人员、同行名单、批次分区、
   最后门点记录全部冻结，之后变化不改旧快照）；四类事件进同一版本流，门点离线重连
   按版本补齐。
-- `tests/` 含 57 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
+- `tests/` 含 87 个端到端测试（真实 HTTP + 进程重启），覆盖下列全部不变量。
 
 ## 需求对应的关键保证
 
@@ -76,6 +76,30 @@
 | 快照之后的变化不能改写旧快照 | 快照存的是冻结副本（人数/名单/`last_gate`/`last_event_version`/`presence_seq` 都是值拷贝），不与 `presence` 做任何 JOIN |
 | 门点离线重连补齐到离场、更正与清点快照事件 | `PRESENCE_ARRIVED` / `PRESENCE_DEPARTED` / `PRESENCE_CORRECTED` / `ROLLCALL_TAKEN` 与票据、策略事件共用同一 append-only 版本流；`/api/gate/sync` 无需特殊处理即按版本有序补齐 |
 | 按分区、批次、人员查询当前在场 / 未确认离场 / 任一次清点结果 | `GET /api/admin/presence?view=onsite\|unconfirmed\|departed\|removed\|all&zone_id=&batch_id=&person_id=&q=`；`GET /api/admin/rollcalls?zone_id=&batch_id=&person_id=`（按人命中其当时在场的快照）；`GET /api/admin/rollcalls/{id}` 取冻结明细；另有 `GET /api/admin/presence/{code}` 单票完整轨迹 |
+
+### 访客路线检查与区域停留监控的关键保证
+
+管理员按分区编排**带顺序的检查点路线**（每点绑定一个门点并设最长停留秒数），路线可发**不可变新版本**、可暂停/恢复；路线绑定到新签发的票或预约批次后，访客首次核销即在入口检查点**开始路线**，之后必须按顺序经过检查点。
+
+| 需求 | 实现方式 |
+|---|---|
+| 管理员按分区编排有顺序的检查点路线、每点设最长停留时间 | `routes`（路线族）+ `route_versions`（不可变版本）+ `route_checkpoints`（版本内 `seq` 顺序、`gate_id`、`max_stay_seconds` NULL=不限、运行时开/闭）；同版本门点不可重复、门点须属路线分区；`POST /api/admin/routes/{id}/versions` |
+| 路线绑定到新签发的票或预约批次 | 发票 `POST /api/admin/tickets` 带 `route_id`；建批 `POST /api/admin/batches` 带 `route_id`（审核签票随票固化）；对未开始的票/未来批次可用 `POST /api/admin/routes/bindings` 改绑；每次绑定追加 `route_bindings` + `ROUTE_BOUND` 事件 |
+| 首次核销开始路线，必须从入口进入 | 核销在条件 UPDATE **之前**做路线判定：非入口门点首次核销 → 403 `wrong_entry_gate`（票不被核销）；入口核销成功即在同一事务创建 `route_progress`（`IN_PROGRESS`，current_seq=1）并写 `ROUTE_STARTED` |
+| 按顺序经过检查点；跳过/重复/进入已关闭点明确拒绝 | `POST /api/gate/checkpoint`：seq>next → 409 `skipped_checkpoint`（终态违规）；seq<next → 409 `duplicate_entry`（非终态拒绝、不推进）；检查点 `closed` → 423 `checkpoint_closed`（终态违规）；门点不在版本路线上 → 403 `gate_not_on_route`；未开始/未绑定 → 409 |
+| 区域停留超时监控 | 进入某点时冻结 `entered_at`，下一次上报比对上一点 `max_stay_seconds`，超时 → 409 `dwell_timeout`（终态违规 `DWELL_TIMEOUT`）；`GET /api/admin/route-progress?overdue=true` 实时列出当前超时停留（含已停留秒数/截止时刻），无需后台清扫 |
+| 每次门点检查保留票、人员、路线版本、检查点顺序、门点 | 每次判定（成功/拒绝/违规/冲突）都向 `route_checks` 追加一行：`ticket_code/person_id/route_id/route_version/checkpoint_seq/gate_id/decision/event_version/http_status/result_json`；`GET /api/admin/route-checks?gate_id=&route_id=&code=&decision=` |
+| 网络抖动重发不重复推进路线 | 检查点接口与核销一样以 `(gate_id, attempt_id)` 唯一约束幂等：重放返回首次结论并带 `replayed:true`，路线只推进一次；入口核销复用 `scan_attempts` 幂等 |
+| 多门点并发上报只能形成一个明确先后 | 所有路线判定都在调用方 `BEGIN IMMEDIATE` 单写事务内串行；同一点并发恰有一个 ADVANCED、另一个拿到 `duplicate_entry`；跳点/超时并发先提交者定终态，落败者拿到明确 409 |
+| 完成/违规是终态，旧事件不能改回进行中 | 状态机 `IN_PROGRESS → COMPLETED/VIOLATED`，推进 SQL 带 `WHERE status='IN_PROGRESS'`；终态后任何在线事件 409（`route_already_completed/violated`），离线迟到事件落冲突而绝不回退 |
+| 暂停或替换未来使用的路线，已开始的走原版本 | 暂停后不能发版本/绑定/开始（在途可继续走到完成）；发新版本只更新 `routes.current_version`，**之后开始**的票用新版本；`route_progress.route_version` 在开始时固化，永不随编排改变 |
+| 检查点可临时关闭，在途访客同样受约束 | `PUT /api/admin/routes/{id}/checkpoints {version,seq,closed}` 只改该版本检查点运行时状态（写 `ROUTE_CHECKPOINT_CLOSED/OPENED` 事件）；在途走固化版本但读到最新开闭状态，进入关闭点即违规 |
+| 门点离线期间事件重连按版本补齐 | 门点 `/api/gate/sync` 分页拉取编排/执行事件（同一条 append-only 版本流）；离线攒下的检查点扫描带**门点本地 `event_ts`**，重连后 `POST /api/gate/checkpoints/replay` 在单事务内按序批量裁决，同 attempt 重放幂等 |
+| 离线冲突保留记录、交管理员处理 | 无法自动裁决（中间缺口 `GAP_PENDING`、迟到 `LATE_EVENT`、终态后到达 `ALREADY_TERMINAL`、未来/非法时间戳 `INVALID_TIMESTAMP`、无路线/票异常）→ `route_event_conflicts` + `ROUTE_CONFLICT` 事件 + 门点记录 `CONFLICT`，路线不推进；`POST /api/admin/route-conflicts/{id}/resolve` 支持 `APPLIED`（补齐后按现场推进）/`MARK_VIOLATED`/`DISMISSED`，冲突记录只追加不删除 |
+| 门点路线目录版本过旧要明示 | 核销/检查点请求带 `route_version`（门点同步游标）；落后于该路线定义事件最新版本 → 409 `stale_route`，**不落任何记录**，门点自动 `/gate/sync` 后用同一 `attempt_id` 重试 |
+| 按分区、批次、人员、路线查询当前点/超时/完成/违规 | `GET /api/admin/route-progress?status=&zone_id=&batch_id=&person_id=&route_id=&overdue=`；`GET /api/admin/route-progress/{code}`（版本检查点定义+完整门点检查记录+冲突）；批次详情 `…/routes` 汇总；人员视图含 `routes`；`GET /api/admin/route-conflicts` |
+
+门点核销响应在路线票上额外携带 `route: {status,current_seq,next_seq,current_checkpoint,next_checkpoint,dwell_seconds,dwell_deadline,overdue,…}`；门点台新增「路线检查点」模式，离线时检查点事件进本地队列、重连后批量补齐（冲突在界面上提示等待管理员处理）。检查点裁决 HTTP 约定：通过/完成 200；重复进入/跳点/超时/终态后上报 409；进入已关闭点 423；门点不在路线/非入口开始 403；目录版本过旧 409 `stale_route`（唯一不落库、可重试的结论）。
 
 ### 核销响应约定（门点端可直接据此亮灯/播报）
 
@@ -142,6 +166,7 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 7. 访客预约：「访客预约批次」卡片填日期/时段/分区/人数上限建批，复制生成的 `/apply?k=…` 链接发给访客；访客提交（可填每位同行人姓名）后容量内为“待审核”，满额自动进候补。右侧「预约批次」标签可按批次审核/取消/拒绝/补录、调整容量、关闭申请、查看候补顺序、已签发票、**申请变更审核队列**与容量变化记录；访客凭申请后保存的管理链接可发起/撤回变更，审核通过后系统原子换发新票，门点扫到旧票会提示改扫新票。
 8. 在场清册：门点台用「入场核销/离场确认」下拉切换模式（离场扫码同样离线排队、attempt 幂等）；管理台「在场清册」标签可按当前在场/未确认离场/已离场/误扫移除与分区、批次、人员过滤，点开任一票查看完整在场轨迹并对漏扫（补登记到场/登记离场）、误扫（移除/纠正回场）做**带原因**的人工更正，更正只追加轨迹、保留操作者。
 9. 应急清点：「应急清点」标签填原因（可选分区/批次范围）一键发起，快照固定当时在场人员、同行名单、批次分区与最后门点；历史快照随时回看，发起后的到场/离场/更正不会改写旧快照。
+10. 访客路线：管理台「访客路线编排」建路线、按顺序添加检查点（门点+最长停留秒数）并发布版本；发票/建批时选择路线（或事后对未开始的票/批次绑定）。门点台切到「路线检查点」模式逐点扫码：首次核销须在入口检查点，跳点/重复/关闭点/停留超时均亮明确结论；可随时关闭检查点、暂停路线或发布新版本（在途访客继续走原版本）。「路线监控」标签按分区/批次/人员/路线查看当前所在检查点、超时停留、已完成与违规历史，并在「离线冲突队列」里处理门点重连补齐时保留的冲突。
 
 ## API 摘要
 
@@ -186,7 +211,9 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 门点端（`Authorization: Bearer <PASSPORT_GATE_TOKEN>`）
 
-- `POST /api/gate/redeem` `{gate_id, code, attempt_id, policy_version}`
+- `POST /api/gate/redeem` `{gate_id, code, attempt_id, policy_version, route_version?}`
+- `POST /api/gate/checkpoint` `{gate_id, code, attempt_id, route_version?}`（已开始路线的逐点检查；同 attempt 幂等）
+- `POST /api/gate/checkpoints/replay` `{gate_id, events:[{code, attempt_id, event_ts?}]}`（离线检查点事件批量按序补齐；冲突落管理队列）
 - `POST /api/gate/departure` `{gate_id, code, attempt_id}`（门点确认离场；同样以 attempt_id 幂等）
 - `POST /api/gate/sync` `{gate_id, since_version}` → `{events:[...], next_since, has_more}`（含封锁策略、到场/离场/更正/清点事件）
 - `GET  /api/gate/heartbeat/{gate_id}`
@@ -201,12 +228,26 @@ PASSPORT_DB=./passport.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 - `POST /api/admin/rollcalls` `{reason, zone_id?, batch_id?, operator?}` → 201 不可变快照
 - `GET  /api/admin/rollcalls?zone_id=&batch_id=&person_id=` / `GET /api/admin/rollcalls/{id}`（历史清点列表 / 任一次清点的冻结明细）
 
+访客路线检查与区域停留监控（管理端，Bearer 管理员令牌）
+
+- `POST /api/admin/routes` `{id?, zone_id, name}` → 路线族
+- `POST /api/admin/routes/{id}/versions` `{checkpoints:[{gate_id, name?, max_stay_seconds?}], note?}` → 201 不可变新版本（替换未来使用，在途走旧版本）
+- `GET  /api/admin/routes` / `GET /api/admin/routes/{id}`（版本/检查点/绑定/执行汇总）
+- `POST /api/admin/routes/{id}/pause` / `resume` `{reason?}`
+- `PUT  /api/admin/routes/{id}/checkpoints` `{version?, seq, closed, reason?}`（检查点开/闭，在途访客同样受约束）
+- `POST /api/admin/routes/bindings` `{route_id, scope:"TICKET"|"BATCH", code?, batch_id?, reason?}`
+- `GET  /api/admin/route-progress?status=&zone_id=&batch_id=&person_id=&route_id=&overdue=`（当前检查点/停留计时/超时/完成/违规）
+- `GET  /api/admin/route-progress/{code}`（单票执行 + 版本检查点定义 + 全部门点检查记录 + 冲突）
+- `GET  /api/admin/route-checks?gate_id=&route_id=&code=&person_id=&decision=`（门点检查流水）
+- `GET  /api/admin/route-conflicts?status=OPEN|RESOLVED|ALL&zone_id=&batch_id=&person_id=&route_id=`
+- `POST /api/admin/route-conflicts/{id}/resolve` `{action:"APPLIED"|"MARK_VIOLATED"|"DISMISSED", reason?, operator?}`
+
 ## 测试
 
 ```bash
 pip install pytest httpx
 python3 -m pytest tests/ -q
-# 57 passed
+# 87 passed
 ```
 
 测试启动真实 uvicorn 子进程打真实 HTTP，包含：双门点线程屏障并发核销（连跑多轮验证）、
@@ -225,7 +266,14 @@ python3 -m pytest tests/ -q
 attempt 幂等、未到场/已离场的明确拒绝、离场不被重放/重扫复活、到场-离场-人工更正并发唯一顺序、
 漏扫补登记（票同事务核销）、漏扫离场、误扫移除、纠正回场且原轨迹保留、
 快照固定且随后变化不改旧快照、按分区/批次范围清点、按分区/批次/人员查询清册与任一次清点、
-门点按版本补齐四类新事件、重启后在场状态/轨迹/快照延续。
+门点按版本补齐四类新事件、重启后在场状态/轨迹/快照延续；
+访客路线：编排校验（未知门点/跨分区/重复门点/非法停留秒数）、首次核销必须在入口、
+版本过旧不消耗且同 attempt 可重试、批次签票继承路线、按序完成、门点不在路线/未开始/未绑定拒绝、
+重复进入不推进、跳点/已关闭点/停留超时判违规、检查记录保留五要素、同 attempt 重放不重复推进、
+**同门点并发上报恰一个推进**、完成/违规终态不被旧事件改回、暂停只挡未来使用而在途走旧版本、
+发新版本后在途固化 v1 而新票走 v2、未开始票可改绑/已开始拒绝、离线按序补齐与幂等、
+缺口/终态后到达/未来时间戳落冲突队列、管理员 APPLIED/MARK_VIOLATED/DISMISSED 处理且记录保留、
+路线事件经 /gate/sync 按版本补齐、按分区/路线/人员/违规历史查询、**重启后执行状态/版本固化/冲突全部延续**。
 
 > 注意：`tests/test_zones.py` 依赖在 `test_system.py` 之后运行（pytest 默认按文件名字序），
 > 因为 test_system 的用例假定“尚未发布任何封锁规则”（门点策略版本为 0）。
@@ -240,6 +288,11 @@ attempt 幂等、未到场/已离场的明确拒绝、离场不被重放/重扫�
 新建 `batches` / `applications` / `batch_capacity_log` / `application_changes` 表，
 以及在场清册的 `presence` / `presence_events` 与应急清点的 `rollcalls` / `rollcall_entries` 表
 （事件与版本号完整保留、继续递增）。
+路线模块上线时第四次重建 `events` 以加入 11 个 `ROUTE_*` 类型与
+`route_id/route_version/checkpoint_seq/progress_id` 列，`tickets`/`batches` 各加
+`route_id/route_version` 列，并新建 `routes` / `route_versions` / `route_checkpoints` /
+`route_bindings` / `route_progress` / `route_checks` / `route_event_conflicts` 表；
+在途路线执行的版本号在 `route_progress` 中固化，迁移不影响既有票与在场记录。
 若库中存在旧版空脚手架表 `presence`（旧枚举 `ON_SITE/ABSENT`）、`presence_corrections`、
 `exit_attempts`、`muster_snapshots`、`muster_entries`，启动时仅在它们**全部为空**时丢弃并按
 新 schema 重建；任何一张含数据都会拒绝启动迁移以免静默丢轨迹，需人工核对。

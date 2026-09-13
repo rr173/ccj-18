@@ -17,15 +17,18 @@ const setQueue = q => localStorage.setItem(queueKey(), JSON.stringify(q));
 const getHist = () => JSON.parse(localStorage.getItem(histKey()) || "[]");
 const setHist = h => localStorage.setItem(histKey(), JSON.stringify(h.slice(0, 50)));
 
-const MODE_LABEL = { in: "入场核销", out: "离场确认" };
+const MODE_LABEL = { in: "入场核销", out: "离场确认", route: "路线检查点" };
 function mode() { return $("mode") ? $("mode").value : "in"; }
 function setModeBtn() {
-  const out = mode() === "out";
+  const m = mode();
+  const out = m === "out";
+  const rt = m === "route";
   const btn = $("btn-redeem");
-  btn.textContent = out ? "确 认 离 场" : "核 销 入 场";
-  btn.classList.toggle("primary", !out);
-  btn.style.background = out ? "#0f7a5a" : "";
-  $("code").placeholder = out ? "T-XXXXXXXX（离场扫码）" : "T-XXXXXXXX";
+  btn.textContent = rt ? "路线检查" : (out ? "确 认 离 场" : "核 销 入 场");
+  btn.classList.toggle("primary", !out && !rt);
+  btn.style.background = out ? "#0f7a5a" : (rt ? "#1f5a8a" : "");
+  $("code").placeholder = rt ? "T-XXXXXXXX（检查点扫码）"
+    : (out ? "T-XXXXXXXX（离场扫码）" : "T-XXXXXXXX");
 }
 $("mode") && ($("mode").onchange = setModeBtn);
 
@@ -64,12 +67,20 @@ function renderBase() {
 
 function renderHistory() {
   const h = getHist();
-  $("history").innerHTML = h.map(x => `<tr>
+  $("history").innerHTML = h.map(x => {
+    const modeBadge = x.mode === "out" ? ' <span class="badge fail">离场</span>'
+      : x.mode === "route" ? ' <span class="badge">检查点</span>' : "";
+    const party = x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人 · v${x.change_version ?? 0}</div>` : "";
+    const resultText = x.ok ? (x.mode === "out" ? "已离场" : (x.mode === "route" ? "检查通过" : "放行"))
+      : (x.mode === "out" ? "离场拒绝" : (x.mode === "route" ? "检查拒绝" : "拒绝"));
+    return `<tr>
     <td>${fmtTime(x.ts)}</td>
-    <td class="mono">${esc(x.code)}${x.mode === "out" ? ' <span class="badge fail">离场</span>' : ""}${x.party_size ? `<div class="muted" style="font-size:11px">${esc(x.applicant || "")} · 共${x.party_size}人 · v${x.change_version ?? 0}</div>` : ""}</td>
-    <td><span class="badge ${x.ok ? "ok" : "fail"}">${x.mode === "out" ? (x.ok ? "已离场" : "离场拒绝") : (x.ok ? "放行" : "拒绝")}</span></td>
+    <td class="mono">${esc(x.code)}${modeBadge}${party}</td>
+    <td><span class="badge ${x.ok ? "ok" : "fail"}">${resultText}</span>
+        ${x.conflict ? `<div class="muted" style="font-size:11px">冲突 ${esc(x.conflict)}</div>` : ""}</td>
     <td>${esc(x.detail || x.status || "")}${x.replayed ? " <span class='muted'>(幂等重放)</span>" : ""}</td>
-  </tr>`).join("") || '<tr><td colspan=4 class="muted">暂无</td></tr>';
+  </tr>`;
+  }).join("") || '<tr><td colspan=4 class="muted">暂无</td></tr>';
 }
 
 function showResult(r, httpStatus, replayed) {
@@ -80,12 +91,28 @@ function showResult(r, httpStatus, replayed) {
   const title = isDeparture
     ? (ok ? "🚪 离场已确认" : "⚠ 离场未确认")
     : (ok ? "✅ 核销成功 · 放行" : "⛔ 拒绝核销");
+  const rt = r.route;
+  const rtLine = rt ? `<br>🧭 路线 <b>${esc(rt.route_id)}</b> v${rt.route_version}
+     · 状态 <b>${esc(rt.status)}</b>
+     ${rt.current_checkpoint ? " · 当前点 <b>#" + rt.current_checkpoint.seq + " " +
+        esc(rt.current_checkpoint.name || rt.current_checkpoint.gate_id) + "</b>" : ""}
+     ${rt.next_checkpoint ? " · 下一点 # " + rt.next_checkpoint.seq + " " +
+        esc(rt.next_checkpoint.name || rt.next_checkpoint.gate_id) : ""}
+     ${rt.dwell_seconds != null ? " · 已停留 <b>" + rt.dwell_seconds + "s</b>" +
+        (rt.overdue ? ' <span class="badge fail">停留超时</span>'
+                    : (rt.dwell_deadline ? " / 限 " + Math.max(0,
+                        Math.round((new Date(rt.dwell_deadline) - new Date()) / 1000)) + "s" : ""))
+       : ""}
+     ${rt.violation_kind ? ' <span class="badge fail">违规 ' + esc(rt.violation_kind) + "</span>" : ""}`
+    : (r.violation_kind ? `<br>⛔ 路线违规：<b>${esc(r.violation_kind)}</b>` : "");
   $("result").innerHTML = `<div class="result-box ${ok ? "ok" : "fail"}">
     <div>${title} ${httpStatus === 409 && r.reason === "already_redeemed" ? "（该票已使用）" : ""}</div>
     <div class="big-code">${esc(r.code || "")}</div>
     <div class="detail">
       ${r.person_id ? "持票人 " + esc(r.person_id) + " · " : ""}状态 ${esc(r.status)} · ${esc(detail)}
       ${r.presence_status ? " · 在场状态 <b>" + esc(r.presence_status) + "</b>" : ""}
+      ${rtLine}
+      ${r.conflict_kind ? `<br>⚠ 离线事件冲突 <b>${esc(r.conflict_kind)}</b>（#${r.conflict_id}），已保留交管理员处理` : ""}
       ${a ? `<br>🏷️ 批次 <b>${esc(a.batch_id)}</b>${a.batch_name ? "（" + esc(a.batch_name) + "）" : ""}
              ${a.visit_date ? " · " + esc(a.visit_date) : ""}
              · 访客 <b>${esc(a.applicant_name || "")}</b>
@@ -103,16 +130,26 @@ function showResult(r, httpStatus, replayed) {
       ${r.reason === "zone_mismatch" ? "<br>本门点分区 <b>" + esc(r.zone_id || "") + "</b>，票据允许分区：" + esc((r.ticket_zones || []).join("、") || "（无）") : ""}
       ${r.lock_rule ? "<br>封锁规则 <b>" + esc(r.lock_rule.rule_id) + "</b>（版本 #" + r.lock_rule.version + "）：" + esc(r.lock_rule.reason || "") : ""}
       ${r.reason === "stale_policy" ? "<br>本门点策略版本 #" + r.policy_version + "，服务器已到 #" + r.current_policy_version + "，正在自动补齐…" : ""}
+      ${r.reason === "stale_route" ? "<br>本门点路线目录版本过旧（#" + r.client_route_version + " → #" + r.current_route_version + "），正在自动补齐…" : ""}
       ${replayed ? "<br>⚠ 本次为同一次扫码的幂等重放，结果以首次为准" : ""}
     </div>
   </div>`;
 }
 
 async function doRedeem(code, attemptId, itemMode) {
-  const path = itemMode === "out" ? "/api/gate/departure" : "/api/gate/redeem";
-  const payload = itemMode === "out"
-    ? { gate_id: gateId(), code, attempt_id: attemptId }
-    : { gate_id: gateId(), code, attempt_id: attemptId, policy_version: getPV() };
+  let path, payload;
+  if (itemMode === "out") {
+    path = "/api/gate/departure";
+    payload = { gate_id: gateId(), code, attempt_id: attemptId };
+  } else if (itemMode === "route") {
+    path = "/api/gate/checkpoint";
+    payload = { gate_id: gateId(), code, attempt_id: attemptId,
+                route_version: getCursor() };
+  } else {
+    path = "/api/gate/redeem";
+    payload = { gate_id: gateId(), code, attempt_id: attemptId,
+                policy_version: getPV(), route_version: getCursor() };
+  }
   try {
     const r = await gateApi("POST", path, payload);
     return r; // fetch 非 2xx 会抛错
@@ -133,6 +170,7 @@ async function scan() {
   if (!code) return;
   $("code").value = "";
   const item = { attempt_id: uuid(), code, ts: new Date().toISOString(),
+                 event_ts: new Date().toISOString(),
                  mode: mode() };
   const queue = getQueue();
   queue.push(item);
@@ -142,22 +180,61 @@ async function scan() {
   $("code").focus();
 }
 
+// 离线期间攒下的“路线检查点”事件：重连后批量补齐（带门点本地事件时间）
+async function replayRouteQueue(routeItems) {
+  const events = routeItems.map(x => ({
+    code: x.code, attempt_id: x.attempt_id,
+    event_ts: x.event_ts || x.ts,
+  }));
+  const data = await gateApi("POST", "/api/gate/checkpoints/replay", {
+    gate_id: gateId(), events,
+  });
+  return (data.results || []).map((r, i) => ({ item: routeItems[i], r }));
+}
+
 async function flushQueue() {
   if (flushing || !gateId()) return;
   flushing = true;
   let queue = getQueue();
   let staleRetries = 0;
+
+  // 离线恢复后：路线检查点事件优先按顺序批量补齐（冲突由服务器保留）
+  const routeItems = queue.filter(x => (x.mode || "in") === "route");
+  const rest = queue.filter(x => (x.mode || "in") !== "route");
+  if (routeItems.length) {
+    try {
+      const pairs = await replayRouteQueue(routeItems);
+      for (const { item, r } of pairs) {
+        const h = getHist();
+        h.unshift({
+          ts: r.ts || item.ts, code: r.code || item.code,
+          ok: !!r.ok, status: r.status, detail: r.reason_text || "",
+          replayed: !!r.replayed, mode: "route",
+          conflict: r.conflict_kind || null,
+        });
+        setHist(h);
+        if (!r.replayed) showResult(r, r.ok ? 200 : 409, false);
+      }
+      setQueue(rest); // 批量补齐成功后，这些离线路线事件全部出队
+      queue = rest;
+      setNet(true, "在线 · " + gateId());
+    } catch (e) {
+      // 批量补齐本身失败（网络/门点停用）：保留在队列，稍后随普通流程重试
+      setNet(false, "离线/连接失败，路线事件待补提交");
+    }
+  }
+
   while (queue.length) {
     const item = queue[0]; // FIFO
     try {
       const r = await doRedeem(item.code, item.attempt_id, item.mode || "in");
-      if (r.reason === "stale_policy") {
-        // 规则版本过旧：不算终态结论，先按版本补齐策略事件再重试同一条
+      if (r.reason === "stale_policy" || r.reason === "stale_route") {
+        // 版本过旧：不算终态结论，先按版本补齐策略/路线编排再重试同一条
         if (++staleRetries > 3) {
-          setNet(false, "策略版本过旧且同步失败，稍候自动重试");
+          setNet(false, "版本过旧且同步失败，稍候自动重试");
           break;
         }
-        toast("封锁规则版本过旧，正在补齐后重试…", "info");
+        toast("规则/路线版本过旧，正在补齐后重试…", "info");
         await sync();
         continue; // 不移出队列，用同一 attempt_id 重试（服务端未记录该次判定）
       }
@@ -175,6 +252,7 @@ async function flushQueue() {
         applicant: r.appointment ? r.appointment.applicant_name : null,
         change_version: r.appointment ? r.appointment.change_version : null,
         mode: item.mode || "in",
+        conflict: r.conflict_kind || null,
       });
       setHist(h);
       if (!r.replayed) showResult(r, r.ok ? 200 : (r.reason === "already_redeemed" ? 409 : 410), false);
@@ -208,7 +286,9 @@ async function sync() {
           ? ` ${e.ticket_code}`
           : (e.application_id ? ` ${e.application_id}` + (e.batch_id ? ` @${e.batch_id}` : "")
              : (e.rollcall_id ? ` 清点${e.rollcall_id}`
-                : (e.batch_id ? ` @${e.batch_id}` : "")));
+                : (e.route_id ? ` 路线${e.route_id}` +
+                   (e.checkpoint_seq ? ` #${e.checkpoint_seq}` : "")
+                   : (e.batch_id ? ` @${e.batch_id}` : ""))));
         lines.push(`#${e.version} ${fmtTime(e.ts)} ${e.type}` +
           target +
           (e.gate_id ? ` @${e.gate_id}` : "") +

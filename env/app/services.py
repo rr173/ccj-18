@@ -19,6 +19,7 @@ from .db import (
     write_tx,
 )
 from . import presence as presence_svc
+from . import routes as routes_svc
 
 # Crockford base32，去掉了易混淆的 I/L/O/U
 _CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -401,6 +402,8 @@ def _issue_ticket_locked(
     party_size: Optional[int] = None,
     replaced_code: Optional[str] = None,
     replacement_reason: Optional[str] = None,
+    route_id: Optional[str] = None,
+    bind_route: bool = False,
 ) -> tuple[str, int]:
     """已在 IMMEDIATE 事务内：插入票并写 TICKET_ISSUED 事件，返回 (code, version)。
 
@@ -408,19 +411,91 @@ def _issue_ticket_locked(
     保证“审核通过”与“票存在且与批次分区一致”原子可见。
     申请变更换发时 ``replaced_code`` 指向被原子撤销的旧票，
     ``replacement_reason`` 记录旧票替换原因（变更说明）。
+
+    路线绑定：
+      * 管理端发票显式给 ``route_id``（bind_route=True）：校验路线 ACTIVE 并
+        写 route_bindings/ROUTE_BOUND，票固化当前版本；
+      * 批次签票（batch_id 非空）：批次若已绑定路线，同事务把路线固化到票；
+      * 变更换发新票：继承被替换旧票的路线版本（旧票已核销不能变更，因此能
+        走到换票的票都尚未开始，继承的是其绑定尚未开始的路线）。
     """
     now = iso(utcnow())
     zone_list = list(zones or [])
     code = _gen_unique_code(conn)
+    route_version: Optional[int] = None
+    binding_event_version: Optional[int] = None
+    if bind_route and route_id:
+        # 管理端发票直接绑定：取 ACTIVE 当前版本并留绑定审计
+        route = routes_svc.get_route(conn, route_id)
+        if route is None:
+            raise ValueError(f"路线不存在: {route_id}")
+        if route["status"] == "PAUSED" or route["current_version"] < 1:
+            raise ValueError("路线已暂停或尚未发布版本，不能绑定发票")
+        route_version = int(route["current_version"])
+    elif not route_id and batch_id:
+        b = get_batch(conn, batch_id)
+        if b is not None and b["route_id"]:
+            route_id = b["route_id"]
+            route_version = int(b["route_version"] or 0) or None
+            # 批次绑定后若路线又发了新版本，签票时固化“当前 ACTIVE 版本”：
+            # 批次绑定代表“这批人走这条路线”，具体版本以开始前最新发布为准，
+            # 一旦开始则在 route_progress 永久固化。
+            route = routes_svc.get_route(conn, route_id)
+            if route is not None and route["status"] == "ACTIVE" and route["current_version"] >= 1:
+                route_version = int(route["current_version"])
+    elif route_id and not bind_route:
+        # 换发继承：调用方显式传入旧票的 route_version（下方再被覆盖为票列）
+        route_version = None
+
     conn.execute(
         """INSERT INTO tickets
                (code,person_id,valid_from,valid_until,issued_at,status,note,zones,
-                batch_id,application_id,party_size,replaced_code,replacement_reason)
-           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?)""",
+                batch_id,application_id,party_size,replaced_code,replacement_reason,
+                route_id,route_version)
+           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?,?,?)""",
         (code, person_id, valid_from, valid_until, now, note,
          json.dumps(zone_list, ensure_ascii=False),
-         batch_id, application_id, party_size, replaced_code, replacement_reason),
+         batch_id, application_id, party_size, replaced_code, replacement_reason,
+         route_id, route_version),
     )
+    if bind_route and route_id and route_version is not None:
+        ev = add_event(
+            conn,
+            "ROUTE_BOUND",
+            ts=now,
+            route_id=route_id,
+            route_version=route_version,
+            ticket_code=code,
+            person_id=person_id,
+            reason="issue_ticket",
+            payload={"scope": "TICKET", "ticket_code": code,
+                     "version": route_version, "operator": "admin"},
+            batch_id=batch_id,
+            application_id=application_id,
+        )
+        conn.execute(
+            "INSERT INTO route_bindings "
+            "(route_id,route_version,scope,ticket_code,batch_id,bound_at,bound_by,"
+            "reason,event_version) VALUES (?,?,'TICKET',?,NULL,?,'admin',?,?)",
+            (route_id, route_version, code, now, "issue_ticket", ev),
+        )
+        binding_event_version = ev
+    elif batch_id and route_id and route_version is not None:
+        # 批次签票继承路线：留票级绑定审计（批次本身绑定事件已在建批/改绑时写过）
+        add_event(
+            conn,
+            "ROUTE_BOUND",
+            ts=now,
+            route_id=route_id,
+            route_version=route_version,
+            ticket_code=code,
+            person_id=person_id,
+            reason="issue_from_bound_batch",
+            payload={"scope": "TICKET", "ticket_code": code,
+                     "version": route_version, "from_batch": batch_id},
+            batch_id=batch_id,
+            application_id=application_id,
+        )
     payload = {
         "valid_from": valid_from,
         "valid_until": valid_until,
@@ -434,6 +509,9 @@ def _issue_ticket_locked(
     if replaced_code is not None:
         payload["replaced_code"] = replaced_code
         payload["replacement_reason"] = replacement_reason
+    if route_id is not None:
+        payload["route_id"] = route_id
+        payload["route_version"] = route_version
     version = add_event(
         conn,
         "TICKET_ISSUED",
@@ -455,16 +533,22 @@ def issue_ticket(
     valid_until: str,
     note: Optional[str] = None,
     zones: Optional[list[str]] = None,
+    route_id: Optional[str] = None,
 ) -> dict:
     with write_tx(conn):
-        code, version = _issue_ticket_locked(
-            conn,
-            person_id=person_id,
-            valid_from=valid_from,
-            valid_until=valid_until,
-            note=note,
-            zones=zones,
-        )
+        try:
+            code, version = _issue_ticket_locked(
+                conn,
+                person_id=person_id,
+                valid_from=valid_from,
+                valid_until=valid_until,
+                note=note,
+                zones=zones,
+                route_id=route_id,
+                bind_route=bool(route_id),
+            )
+        except ValueError as e:
+            return {"http_status": 400, "error": str(e)}
         row = conn.execute("SELECT * FROM tickets WHERE code=?", (code,)).fetchone()
     result = ticket_dict(row)
     result["version"] = version
@@ -562,6 +646,7 @@ def redeem(
     gate_id: str,
     attempt_id: str,
     policy_version: int = 0,
+    route_version: int = 0,
 ) -> dict:
     """核销一张票。
 
@@ -693,69 +778,105 @@ def redeem(
                             }
                             http_status = 423
                         else:
-                            # 条件 UPDATE：并发核销时只有一个门点 rowcount=1
-                            cur = conn.execute(
-                                """UPDATE tickets
-                                      SET status='REDEEMED', redeemed_at=?,
-                                          redeemed_gate=?
-                                    WHERE code=? AND status='ACTIVE'""",
-                                (now, gate_id, code),
+                            # 绑定了检查路线的票：核销即“开始路线”，必须从入口
+                            # 检查点进入（首次核销开始路线）。stale_route 与
+                            # stale_policy 一样不落扫码记录，门点同步后用同一
+                            # attempt_id 重试；其余路线拒绝是明确业务结论。
+                            route_pre = routes_svc.redeem_route_precheck_locked(
+                                conn,
+                                ticket=ticket,
+                                gate_id=gate_id,
+                                attempt_id=attempt_id,
+                                client_route_version=route_version,
+                                now=now,
                             )
-                            if cur.rowcount != 1:  # 理论上被锁保护，不会走到
-                                response = {
-                                    "ok": False, "status": "REDEEMED",
-                                    "code": code, "person_id": person_id,
-                                    "gate_id": gate_id, "ts": now,
-                                    "reason": "already_redeemed",
-                                    "reason_text": REASON_TEXT["already_redeemed"],
+                            if route_pre is not None and route_pre.get("early"):
+                                return {
+                                    "http_status": 409,
+                                    "response": route_pre["early"],
                                 }
-                                http_status = 409
+                            route_reject = (
+                                route_pre if route_pre is not None else None)
+                            if route_reject is not None:
+                                response = route_reject["response"]
+                                http_status = route_reject["http_status"]
                             else:
-                                version = add_event(
-                                    conn,
-                                    "TICKET_REDEEMED",
-                                    ts=now,
-                                    ticket_code=code,
-                                    person_id=person_id,
-                                    gate_id=gate_id,
-                                    reason="gate_scan",
-                                    payload={
-                                        "gate_id": gate_id,
-                                        "attempt_id": attempt_id,
-                                        "zone_id": gate_zone,
-                                        "policy_version": policy_now,
-                                    },
-                                    batch_id=ticket["batch_id"],
-                                    application_id=ticket["application_id"],
+                                # 条件 UPDATE：并发核销时只有一个门点 rowcount=1
+                                cur = conn.execute(
+                                    """UPDATE tickets
+                                          SET status='REDEEMED', redeemed_at=?,
+                                              redeemed_gate=?
+                                        WHERE code=? AND status='ACTIVE'""",
+                                    (now, gate_id, code),
                                 )
-                                response = {
-                                    "ok": True, "status": "REDEEMED",
-                                    "code": code, "person_id": person_id,
-                                    "gate_id": gate_id, "ts": now,
-                                    "version": version,
-                                    "valid_until": ticket["valid_until"],
-                                    "reason_text": REASON_TEXT["ok"],
-                                }
-                                # 核销成功即在同一事务登记到场（申请人+同行
-                                # 人数当场冻结）。已 DEPARTED/REMOVED 的票不
-                                # 自动复活，只在响应里标注当前在场状态。
-                                arrival_version = presence_svc.register_arrival_locked(
-                                    conn,
-                                    ticket=ticket,
-                                    gate_id=gate_id,
-                                    attempt_id=attempt_id,
-                                    now=now,
-                                    policy_version=policy_now,
-                                )
-                                pres = presence_svc.get_presence(conn, code)
-                                response["presence_status"] = (
-                                    pres["status"] if pres else "ARRIVED")
-                                if arrival_version is not None:
-                                    response["arrival_version"] = arrival_version
-                                appt = appointment_info(conn, code)
-                                if appt:
-                                    response["appointment"] = appt
-                                http_status = 200
+                                if cur.rowcount != 1:  # 理论上被锁保护，不会走到
+                                    response = {
+                                        "ok": False, "status": "REDEEMED",
+                                        "code": code, "person_id": person_id,
+                                        "gate_id": gate_id, "ts": now,
+                                        "reason": "already_redeemed",
+                                        "reason_text": REASON_TEXT["already_redeemed"],
+                                    }
+                                    http_status = 409
+                                else:
+                                    version = add_event(
+                                        conn,
+                                        "TICKET_REDEEMED",
+                                        ts=now,
+                                        ticket_code=code,
+                                        person_id=person_id,
+                                        gate_id=gate_id,
+                                        reason="gate_scan",
+                                        payload={
+                                            "gate_id": gate_id,
+                                            "attempt_id": attempt_id,
+                                            "zone_id": gate_zone,
+                                            "policy_version": policy_now,
+                                        },
+                                        batch_id=ticket["batch_id"],
+                                        application_id=ticket["application_id"],
+                                    )
+                                    response = {
+                                        "ok": True, "status": "REDEEMED",
+                                        "code": code, "person_id": person_id,
+                                        "gate_id": gate_id, "ts": now,
+                                        "version": version,
+                                        "valid_until": ticket["valid_until"],
+                                        "reason_text": REASON_TEXT["ok"],
+                                    }
+                                    # 核销成功即在同一事务登记到场（申请人+同行
+                                    # 人数当场冻结）。已 DEPARTED/REMOVED 的票不
+                                    # 自动复活，只在响应里标注当前在场状态。
+                                    arrival_version = presence_svc.register_arrival_locked(
+                                        conn,
+                                        ticket=ticket,
+                                        gate_id=gate_id,
+                                        attempt_id=attempt_id,
+                                        now=now,
+                                        policy_version=policy_now,
+                                    )
+                                    pres = presence_svc.get_presence(conn, code)
+                                    response["presence_status"] = (
+                                        pres["status"] if pres else "ARRIVED")
+                                    if arrival_version is not None:
+                                        response["arrival_version"] = arrival_version
+                                    # 首次核销同事务开始检查路线（固化路线版本）
+                                    ticket_after = conn.execute(
+                                        "SELECT * FROM tickets WHERE code=?", (code,)
+                                    ).fetchone()
+                                    route_block = routes_svc.start_route_after_redeem_locked(
+                                        conn,
+                                        ticket=ticket_after,
+                                        gate_id=gate_id,
+                                        attempt_id=attempt_id,
+                                        now=now,
+                                    )
+                                    if route_block is not None:
+                                        response["route"] = route_block
+                                    appt = appointment_info(conn, code)
+                                    if appt:
+                                        response["appointment"] = appt
+                                    http_status = 200
                 elif status == "REDEEMED":
                     response = {
                         "ok": False, "status": "REDEEMED", "code": code,
@@ -765,6 +886,12 @@ def redeem(
                         "redeemed_at": ticket["redeemed_at"],
                         "redeemed_gate": ticket["redeemed_gate"],
                     }
+                    # 已开始检查路线的票：门点得知路线当前状态（应改用检查点模式）
+                    if ticket["route_id"]:
+                        rp = routes_svc.get_progress_by_ticket(conn, code)
+                        if rp is not None:
+                            response["route"] = routes_svc.route_status_block(
+                                conn, rp, now)
                     http_status = 409
                 elif status == "REVOKED":
                     response = {
@@ -962,18 +1089,32 @@ def create_batch(
     zone_id: str,
     capacity: int,
     name: Optional[str] = None,
+    route_id: Optional[str] = None,
+    operator: str = "admin",
 ) -> dict:
     now = iso(utcnow())
     batch_id = _gen_batch_id(conn)
     token = _new_token()
     with write_tx(conn):
+        route_version: Optional[int] = None
+        if route_id:
+            route = routes_svc.get_route(conn, route_id)
+            if route is None:
+                return {"http_status": 400, "error": f"路线不存在: {route_id}"}
+            if route["zone_id"] != zone_id:
+                return {"http_status": 400,
+                        "error": f"路线分区 {route['zone_id']} 与批次分区 {zone_id} 不一致"}
+            if route["status"] == "PAUSED" or route["current_version"] < 1:
+                return {"http_status": 409,
+                        "error": "路线已暂停或尚未发布版本，不能绑定批次"}
+            route_version = int(route["current_version"])
         conn.execute(
             """INSERT INTO batches
                    (id,name,visit_date,start_at,end_at,zone_id,capacity,
-                    apply_token,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                    apply_token,created_at,route_id,route_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (batch_id, name, visit_date, start_at, end_at, zone_id, capacity,
-             token, now),
+             token, now, route_id, route_version),
         )
         conn.execute(
             """INSERT INTO batch_capacity_log
@@ -994,11 +1135,33 @@ def create_batch(
                 "end_at": end_at,
                 "zone_id": zone_id,
                 "capacity": capacity,
+                "route_id": route_id,
+                "route_version": route_version,
             },
         )
+        if route_id:
+            bind_version = add_event(
+                conn,
+                "ROUTE_BOUND",
+                ts=now,
+                batch_id=batch_id,
+                route_id=route_id,
+                route_version=route_version,
+                reason="create_batch",
+                payload={"scope": "BATCH", "batch_id": batch_id,
+                         "version": route_version, "operator": operator},
+            )
+            conn.execute(
+                "INSERT INTO route_bindings "
+                "(route_id,route_version,scope,ticket_code,batch_id,bound_at,bound_by,"
+                "reason,event_version) VALUES (?,?,'BATCH',NULL,?,?,?,?,?)",
+                (route_id, route_version, batch_id, now, operator,
+                 "create_batch", bind_version),
+            )
         row = get_batch(conn, batch_id)
     d = batch_dict(row, used=0, counts=_empty_counts(), now=now)
     d["apply_token"] = token
+    d.pop("http_status", None)
     return d
 
 
@@ -2017,6 +2180,8 @@ def approve_application_change(
                     replaced_code=old_ticket["code"],
                     replacement_reason=replacement_reason,
                     now=now,
+                    route_id=old_ticket["route_id"],
+                    route_version=old_ticket["route_version"],
                 )
         else:
             # PENDING / WAITLISTED：不发票；资料按新总人数改写后，重新跑一遍
@@ -2114,16 +2279,22 @@ def _issue_ticket_with_code_locked(
 ) -> int:
     """同 _issue_ticket_locked 但使用指定票号（原子换票时旧票先记了新票号）。"""
     zone_list = list(kwargs.get("zones") or [])
+    # 变更换发：继承旧票的路线绑定（走到换票的票必然未核销=路线未开始，
+    # 因此连同固化版本一起继承；已开始路线的票根本不允许变更）。
+    inherited_route_id = kwargs.get("route_id")
+    inherited_route_version = kwargs.get("route_version")
     conn.execute(
         """INSERT INTO tickets
                (code,person_id,valid_from,valid_until,issued_at,status,note,zones,
-                batch_id,application_id,party_size,replaced_code,replacement_reason)
-           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?)""",
+                batch_id,application_id,party_size,replaced_code,replacement_reason,
+                route_id,route_version)
+           VALUES (?,?,?,?,?,'ACTIVE',?,?,?,?,?,?,?,?,?)""",
         (code, kwargs["person_id"], kwargs["valid_from"], kwargs["valid_until"], now,
          kwargs.get("note"), json.dumps(zone_list, ensure_ascii=False),
          kwargs.get("batch_id"), kwargs.get("application_id"),
          kwargs.get("party_size"), kwargs.get("replaced_code"),
-         kwargs.get("replacement_reason")),
+         kwargs.get("replacement_reason"),
+         inherited_route_id, inherited_route_version),
     )
     payload = {
         "valid_from": kwargs["valid_from"],
@@ -2136,6 +2307,9 @@ def _issue_ticket_with_code_locked(
         "batch_id": kwargs.get("batch_id"),
         "application_id": kwargs.get("application_id"),
     }
+    if inherited_route_id is not None:
+        payload["route_id"] = inherited_route_id
+        payload["route_version"] = inherited_route_version
     return add_event(
         conn,
         "TICKET_ISSUED",
@@ -2316,6 +2490,16 @@ def batch_detail(conn: sqlite3.Connection, batch_id: str) -> Optional[dict]:
         "onsite_people": sum(
             p["party_size"] for p in presence_rows if p["status"] == "ARRIVED"),
     }
+    # 检查路线：本批次当前所在检查点 / 超时停留 / 已完成 / 违规
+    route_progress = routes_svc.list_progress(conn, batch_id=batch_id)
+    route_summary = {
+        "route_id": batch["route_id"],
+        "route_version": batch["route_version"],
+        "in_progress": [p for p in route_progress if p["status"] == "IN_PROGRESS"],
+        "overdue": [p for p in route_progress if p.get("overdue")],
+        "completed": [p for p in route_progress if p["status"] == "COMPLETED"],
+        "violated": [p for p in route_progress if p["status"] == "VIOLATED"],
+    }
     return {
         "batch": batch_dict(
             batch, used=_used_seats(conn, batch_id),
@@ -2329,6 +2513,7 @@ def batch_detail(conn: sqlite3.Connection, batch_id: str) -> Optional[dict]:
         "capacity_log": capacity_log(conn, batch_id),
         "events": events,
         "presence": presence_summary,
+        "routes": route_summary,
         "now": now,
     }
 
@@ -2507,7 +2692,23 @@ def get_person_view(conn: sqlite3.Connection, person_id: str) -> Optional[dict]:
         "scan_attempts": attempts,
         "gates": gates,
         "presence": _person_presence(conn, person_id, codes),
+        "routes": _person_routes(conn, person_id),
     }
+
+
+def _person_routes(conn: sqlite3.Connection, person_id: str) -> list[dict]:
+    """人员视图：该人名下每条已开始路线的当前状态/超时/终态。"""
+    out = []
+    now = iso(utcnow())
+    for p in conn.execute(
+        "SELECT * FROM route_progress WHERE person_id=? ORDER BY started_at DESC",
+        (person_id,),
+    ).fetchall():
+        block = routes_svc.route_status_block(conn, p, now)
+        block.update({"id": p["id"], "ticket_code": p["ticket_code"],
+                      "batch_id": p["batch_id"]})
+        out.append(block)
+    return out
 
 
 def _person_presence(
@@ -2679,5 +2880,23 @@ def stats(conn: sqlite3.Connection) -> dict:
         "onsite_people": int(onsite["p"]),
         "rollcalls": conn.execute(
             "SELECT COUNT(*) c FROM rollcalls"
+        ).fetchone()["c"],
+        "routes": conn.execute(
+            "SELECT COUNT(*) c FROM routes"
+        ).fetchone()["c"],
+        "routes_paused": conn.execute(
+            "SELECT COUNT(*) c FROM routes WHERE status='PAUSED'"
+        ).fetchone()["c"],
+        "route_in_progress": conn.execute(
+            "SELECT COUNT(*) c FROM route_progress WHERE status='IN_PROGRESS'"
+        ).fetchone()["c"],
+        "route_completed": conn.execute(
+            "SELECT COUNT(*) c FROM route_progress WHERE status='COMPLETED'"
+        ).fetchone()["c"],
+        "route_violated": conn.execute(
+            "SELECT COUNT(*) c FROM route_progress WHERE status='VIOLATED'"
+        ).fetchone()["c"],
+        "route_open_conflicts": conn.execute(
+            "SELECT COUNT(*) c FROM route_event_conflicts WHERE status='OPEN'"
         ).fetchone()["c"],
     }

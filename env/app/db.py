@@ -64,6 +64,20 @@ EVENT_TYPES = (
     "PRESENCE_CORRECTED",
     # 应急清点：管理员发起一次快照（快照本体落 rollcall* 表，事件进版本流）
     "ROLLCALL_TAKEN",
+    # 访客路线：版本编排 / 暂停恢复 / 绑定 / 检查点开闭
+    "ROUTE_CREATED",
+    "ROUTE_VERSION_PUBLISHED",
+    "ROUTE_PAUSED",
+    "ROUTE_RESUMED",
+    "ROUTE_BOUND",
+    "ROUTE_CHECKPOINT_CLOSED",
+    "ROUTE_CHECKPOINT_OPENED",
+    # 访客路线：执行（首次核销开始 / 逐点推进 / 完成 / 违规 / 离线冲突）
+    "ROUTE_STARTED",
+    "ROUTE_CHECKPOINT",
+    "ROUTE_COMPLETED",
+    "ROUTE_VIOLATED",
+    "ROUTE_CONFLICT",
 )
 RULE_ACTIONS = ("LOCK", "UNLOCK")
 
@@ -90,6 +104,50 @@ APPLICATION_STATUSES = (
 )
 # 占名额的状态（待审核占座 + 已审核占座）
 CAPACITY_HOLDING_STATUSES = ("PENDING", "APPROVED")
+
+# ---------------- 访客路线检查与区域停留监控 ----------------
+#
+# 路线族（routes）：管理员按分区编排，可发多个不可变版本（route_versions），
+# 每个版本是一串带顺序的检查点（route_checkpoints，一个检查点绑定一个门点，
+# 带该点最长停留秒数与运行时开/闭状态）。ACTIVE 版本供“未来使用”，可暂停或
+# 发新版本替换；已开始的路线执行（route_progress）把当时版本号固化，继续走旧
+# 版本，编排变更不影响在途访客。
+#
+# 路线执行状态机（route_progress.status，终态不可逆）：
+#   IN_PROGRESS（首次核销在入口检查点开始）
+#     -> COMPLETED  （按顺序通过最后一个检查点）
+#     -> VIOLATED   （跳过 / 进入已关闭检查点 / 停留超时；终态，任何旧事件都
+#                    不能把它改回 IN_PROGRESS）
+#   重复进入同一检查点不是终态违规：明确拒绝、路线不推进，但保留门点记录。
+# 每次门点判定（成功/拒绝）都向 route_checks 追加一行（票、人员、路线版本、
+# 检查点顺序、门点、attempt 幂等键、事件版本），并发下全部在 IMMEDIATE 事务
+# 里串行，只有一个明确先后。门点离线期间攒下的检查点事件重连批量补齐，无法
+# 自动判定的（缺口/迟到/终态后到达/时间戳异常）落 route_event_conflicts，
+# 保留冲突记录等管理员处理，绝不静默丢弃也不擅自推进。
+ROUTE_STATUSES = ("ACTIVE", "PAUSED")
+ROUTE_PROGRESS_STATUSES = ("IN_PROGRESS", "COMPLETED", "VIOLATED")
+
+# 违规类型（violation_kind）
+VIOLATION_SKIPPED = "SKIPPED_CHECKPOINT"     # 跳过未到的检查点（在线明确跳点）
+VIOLATION_CLOSED = "CHECKPOINT_CLOSED"       # 进入已关闭检查点
+VIOLATION_DWELL = "DWELL_TIMEOUT"            # 在上一检查点停留超过最长时间
+# 拒绝但非终态（route_checks.decision=REJECTED，重复进入）
+REJECT_DUPLICATE = "DUPLICATE_ENTRY"         # 重复进入当前检查点
+
+# 离线补齐冲突类型（route_event_conflicts.kind，全部需管理员处理）
+CONFLICT_GAP = "GAP_PENDING"                 # 中间有检查点事件缺失
+CONFLICT_LATE = "LATE_EVENT"                 # 已越过该点后旧事件才到达
+CONFLICT_TERMINAL = "ALREADY_TERMINAL"       # 路线已完成/违规后旧事件到达
+CONFLICT_INVALID_TS = "INVALID_TIMESTAMP"    # 事件时间戳异常（未来时间/早于路线开始）
+CONFLICT_NO_ROUTE = "NO_ROUTE"               # 票未绑定路线 / 路线未开始
+CONFLICT_TICKET = "TICKET_STATE"             # 票面不存在或已作废/过期
+
+CONFLICT_KINDS = (
+    CONFLICT_GAP, CONFLICT_LATE, CONFLICT_TERMINAL,
+    CONFLICT_INVALID_TS, CONFLICT_NO_ROUTE, CONFLICT_TICKET,
+)
+# 冲突处理动作
+CONFLICT_RESOLUTIONS = ("DISMISSED", "APPLIED", "MARK_VIOLATED")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS zones (
@@ -126,7 +184,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     party_size     INTEGER,         -- 预约批次签发的票：同行总人数（含申请人）
     replaced_code  TEXT,            -- 变更换发的新票：原子替换掉的旧票号
     replaced_by_code TEXT,          -- 变更撤销的旧票：原子换发出来的新票号
-    replacement_reason TEXT         -- 作为旧票被撤销时的撤销原因（变更说明）
+    replacement_reason TEXT,        -- 作为旧票被撤销时的撤销原因（变更说明）
+    route_id       TEXT,            -- 绑定的检查路线（绑定时固化）
+    route_version  INTEGER          -- 绑定/开始时使用的路线版本（在途不随编排变）
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_person ON tickets(person_id);
 
@@ -145,7 +205,12 @@ CREATE TABLE IF NOT EXISTS events (
                        'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
                        'APPLICATION_CHANGE_EXPIRED',
                        'PRESENCE_ARRIVED','PRESENCE_DEPARTED','PRESENCE_CORRECTED',
-                       'ROLLCALL_TAKEN')),
+                       'ROLLCALL_TAKEN',
+                       'ROUTE_CREATED','ROUTE_VERSION_PUBLISHED','ROUTE_PAUSED',
+                       'ROUTE_RESUMED','ROUTE_BOUND',
+                       'ROUTE_CHECKPOINT_CLOSED','ROUTE_CHECKPOINT_OPENED',
+                       'ROUTE_STARTED','ROUTE_CHECKPOINT','ROUTE_COMPLETED',
+                       'ROUTE_VIOLATED','ROUTE_CONFLICT')),
     ticket_code    TEXT,
     person_id      TEXT,
     gate_id        TEXT,
@@ -153,10 +218,15 @@ CREATE TABLE IF NOT EXISTS events (
     payload        TEXT NOT NULL,
     batch_id       TEXT,
     application_id TEXT,
-    rollcall_id    TEXT               -- ROLLCALL_TAKEN 事件：对应快照
+    rollcall_id    TEXT,              -- ROLLCALL_TAKEN 事件：对应快照
+    route_id       TEXT,              -- 路线事件：路线族 ID
+    route_version  INTEGER,           -- 路线事件：当时路线版本号
+    checkpoint_seq INTEGER,           -- 检查点事件：检查点顺序（1 起）
+    progress_id    TEXT               -- 路线执行事件：route_progress.id
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_code);
 CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
+CREATE INDEX IF NOT EXISTS idx_events_route ON events(route_id);
 
 -- 封锁/解除封锁规则：rule_id 幂等去重；version 对应该规则的事件版本
 CREATE TABLE IF NOT EXISTS policy_rules (
@@ -202,7 +272,9 @@ CREATE TABLE IF NOT EXISTS batches (
     capacity    INTEGER NOT NULL CHECK (capacity > 0),  -- 人数上限（含同行人）
     apply_token TEXT NOT NULL UNIQUE,        -- 一次性申请链接的秘密令牌
     created_at  TEXT NOT NULL,
-    closed_at   TEXT                          -- 管理员提前关闭申请；NULL=开放
+    closed_at   TEXT,                         -- 管理员提前关闭申请；NULL=开放
+    route_id    TEXT,                         -- 绑定路线（审核签票时随票固化版本）
+    route_version INTEGER                     -- 绑定时的路线版本（仅审计展示）
 );
 CREATE INDEX IF NOT EXISTS idx_batches_date ON batches(visit_date);
 
@@ -382,6 +454,165 @@ CREATE INDEX IF NOT EXISTS idx_rollcall_entries_rc ON rollcall_entries(rollcall_
 CREATE INDEX IF NOT EXISTS idx_rollcall_entries_batch ON rollcall_entries(batch_id);
 CREATE INDEX IF NOT EXISTS idx_rollcall_entries_zone ON rollcall_entries(zone_id);
 CREATE INDEX IF NOT EXISTS idx_rollcall_entries_person ON rollcall_entries(person_id);
+
+-- ---------------- 访客路线检查与区域停留监控 ----------------
+
+-- 路线族：按分区编排；当前 ACTIVE 版本供未来签发/绑定使用，可暂停或替换
+CREATE TABLE IF NOT EXISTS routes (
+    id           TEXT PRIMARY KEY,          -- RT-XXXXXXXX
+    zone_id      TEXT NOT NULL,             -- 路线所属分区（检查点门点须在本分区）
+    name         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'ACTIVE'
+                 CHECK (status IN ('ACTIVE','PAUSED')),
+    current_version INTEGER NOT NULL DEFAULT 0,  -- 当前版本号（0=尚未发布任何版本）
+    paused_at    TEXT,
+    paused_reason TEXT,
+    created_at   TEXT NOT NULL,
+    created_by   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_routes_zone ON routes(zone_id);
+
+-- 路线版本：内容不可变（检查点顺序/门点/最长停留秒数发布后固定）。
+-- 在途执行把版本号固化进 route_progress，发新版本/暂停都不影响旧版本执行。
+CREATE TABLE IF NOT EXISTS route_versions (
+    route_id     TEXT NOT NULL,
+    version      INTEGER NOT NULL,         -- 路线族内单调递增，从 1 开始
+    created_at   TEXT NOT NULL,
+    created_by   TEXT,
+    note         TEXT,
+    event_version INTEGER NOT NULL,        -- ROUTE_VERSION_PUBLISHED 的全局事件版本
+    PRIMARY KEY (route_id, version)
+);
+
+-- 检查点：一个版本内按 seq 排序；每个检查点绑定一个门点，max_stay_seconds
+-- 为该点最长停留时间（NULL=不限）。closed 是运行时开/闭（管理员可随时开闭，
+-- 产生 ROUTE_CHECKPOINT_CLOSED/OPENED 事件）；在途访客走的是版本固化的检查点
+-- 行，因此对旧版本关闭检查点同样对旧版本执行生效（“进入已关闭检查点”）。
+CREATE TABLE IF NOT EXISTS route_checkpoints (
+    route_id      TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,        -- 顺序，从 1 开始
+    gate_id       TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    max_stay_seconds INTEGER,               -- 最长停留秒数；NULL=不限
+    closed        INTEGER NOT NULL DEFAULT 0,
+    closed_at     TEXT,
+    closed_reason TEXT,
+    PRIMARY KEY (route_id, version, seq),
+    UNIQUE (route_id, version, gate_id)     -- 同一版本内一个门点只能出现一次
+);
+CREATE INDEX IF NOT EXISTS idx_rchk_gate ON route_checkpoints(gate_id);
+
+-- 路线绑定审计：票或批次绑定到某条路线（绑定时固化当前版本号）。append-only。
+CREATE TABLE IF NOT EXISTS route_bindings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id     TEXT NOT NULL,
+    route_version INTEGER NOT NULL,
+    scope        TEXT NOT NULL CHECK (scope IN ('TICKET','BATCH')),
+    ticket_code  TEXT,
+    batch_id     TEXT,
+    bound_at     TEXT NOT NULL,
+    bound_by     TEXT,
+    reason       TEXT,
+    event_version INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rbind_ticket ON route_bindings(ticket_code);
+CREATE INDEX IF NOT EXISTS idx_rbind_batch ON route_bindings(batch_id);
+
+-- 路线执行：每张绑定路线的票至多一行，首次核销（入口检查点）时创建。
+-- 路线版本在此固化；状态机 IN_PROGRESS -> COMPLETED/VIOLATED（终态不可逆，
+-- 完成/违规后任何迟到的旧事件都不可能改回 IN_PROGRESS）。
+CREATE TABLE IF NOT EXISTS route_progress (
+    id             TEXT PRIMARY KEY,        -- RP-XXXXXXXX
+    ticket_code    TEXT NOT NULL UNIQUE,
+    person_id      TEXT NOT NULL,
+    route_id       TEXT NOT NULL,
+    route_version  INTEGER NOT NULL,        -- 开始时固化的版本
+    application_id TEXT,
+    batch_id       TEXT,
+    zone_id        TEXT NOT NULL,
+    status         TEXT NOT NULL
+                   CHECK (status IN ('IN_PROGRESS','COMPLETED','VIOLATED')),
+    next_seq       INTEGER NOT NULL DEFAULT 1,   -- 下一个应到的检查点顺序
+    current_seq    INTEGER,                     -- 当前所在检查点（NULL=尚未进入）
+    started_at     TEXT,
+    started_gate   TEXT,
+    started_version INTEGER,                   -- ROUTE_STARTED 全局事件版本
+    entered_at     TEXT,                        -- 进入当前检查点的时间（停留计时）
+    last_seq       INTEGER,                     -- 最近一次进入的检查点顺序
+    last_gate      TEXT,
+    last_at        TEXT,
+    completed_at   TEXT,
+    completed_version INTEGER,
+    violated_at    TEXT,
+    violated_version INTEGER,
+    violation_kind TEXT,
+    violation_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rprog_status ON route_progress(status);
+CREATE INDEX IF NOT EXISTS idx_rprog_route ON route_progress(route_id, status);
+CREATE INDEX IF NOT EXISTS idx_rprog_batch ON route_progress(batch_id);
+CREATE INDEX IF NOT EXISTS idx_rprog_zone ON route_progress(zone_id);
+CREATE INDEX IF NOT EXISTS idx_rprog_person ON route_progress(person_id);
+
+-- 门点检查记录：每次路线相关门点判定（含拒绝、离线补齐、冲突）都追加一行。
+-- (gate_id, attempt_id) 唯一：同一次物理上报因网络抖动重发绝不重复推进。
+CREATE TABLE IF NOT EXISTS route_checks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id        TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    ticket_code    TEXT NOT NULL,
+    person_id      TEXT,
+    route_id       TEXT,
+    route_version  INTEGER,
+    checkpoint_seq INTEGER,
+    at             TEXT NOT NULL,           -- 服务器处理时间
+    event_ts       TEXT,                    -- 门点事件时间（离线补齐时为当时）
+    decision       TEXT NOT NULL            -- ADVANCED/REJECTED/STARTED/COMPLETED/
+                   CHECK (decision IN ('STARTED','ADVANCED','COMPLETED','REJECTED',
+                                       'VIOLATED','CONFLICT')),
+    result         TEXT NOT NULL,           -- ok / reason（duplicate/closed/...）
+    reason         TEXT,
+    event_version  INTEGER,                 -- 对应全局事件版本（拒绝无事件时 NULL）
+    conflict_id    INTEGER,                 -- CONFLICT 时对应 route_event_conflicts.id
+    replayed       INTEGER NOT NULL DEFAULT 0,
+    offline        INTEGER NOT NULL DEFAULT 0,
+    http_status    INTEGER NOT NULL,
+    result_json    TEXT NOT NULL,
+    UNIQUE (gate_id, attempt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rchecks_code ON route_checks(ticket_code);
+CREATE INDEX IF NOT EXISTS idx_rchecks_route ON route_checks(route_id);
+CREATE INDEX IF NOT EXISTS idx_rchecks_gate ON route_checks(gate_id);
+
+-- 离线补齐冲突：无法自动判定的离线检查点事件保留在此，等管理员处理。
+-- 只插入/追加处理结论，从不删除（处理后 status 置 RESOLVED 并留痕）。
+CREATE TABLE IF NOT EXISTS route_event_conflicts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id        TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    ticket_code    TEXT NOT NULL,
+    person_id      TEXT,
+    route_id       TEXT,
+    route_version  INTEGER,
+    checkpoint_seq INTEGER,
+    kind           TEXT NOT NULL
+                   CHECK (kind IN ('GAP_PENDING','LATE_EVENT','ALREADY_TERMINAL',
+                                   'INVALID_TIMESTAMP','NO_ROUTE','TICKET_STATE')),
+    event_ts       TEXT,                    -- 门点上报的事件时间
+    detected_at    TEXT NOT NULL,           -- 服务器发现冲突的时间
+    detail         TEXT NOT NULL,           -- JSON：冲突现场快照
+    status         TEXT NOT NULL DEFAULT 'OPEN'
+                   CHECK (status IN ('OPEN','RESOLVED')),
+    resolution     TEXT CHECK (resolution IS NULL OR resolution IN
+                   ('DISMISSED','APPLIED','MARK_VIOLATED')),
+    resolved_at    TEXT,
+    resolved_by    TEXT,
+    resolve_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_conf_status ON route_event_conflicts(status);
+CREATE INDEX IF NOT EXISTS idx_conf_code ON route_event_conflicts(ticket_code);
+CREATE INDEX IF NOT EXISTS idx_conf_route ON route_event_conflicts(route_id);
 """
 
 
@@ -424,7 +655,13 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
         _drop_legacy_scaffolds(conn)
-        conn.executescript(SCHEMA)
+        try:
+            conn.executescript(SCHEMA)
+        except sqlite3.OperationalError as e:
+            # 老库 events 表缺少路线模块新列时，SCHEMA 中依赖新列的索引会先
+            # 失败；跳过该错误，下方 _migrate 重建 events 后再补建索引。
+            if "route_id" not in str(e):
+                raise
         _migrate(conn)
     finally:
         conn.close()
@@ -498,6 +735,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tickets ADD COLUMN replaced_by_code TEXT")
     if "replacement_reason" not in ticket_cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN replacement_reason TEXT")
+    if "route_id" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN route_id TEXT")
+    if "route_version" not in ticket_cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN route_version INTEGER")
+
+    batch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)")}
+    if "route_id" not in batch_cols:
+        conn.execute("ALTER TABLE batches ADD COLUMN route_id TEXT")
+    if "route_version" not in batch_cols:
+        conn.execute("ALTER TABLE batches ADD COLUMN route_version INTEGER")
 
     app_cols = {r["name"] for r in conn.execute("PRAGMA table_info(applications)")}
     if "change_version" not in app_cols:
@@ -517,8 +764,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "APPLICATION_SUBMITTED" not in row["sql"]
         or "APPLICATION_CHANGE_SUBMITTED" not in row["sql"]
         or "PRESENCE_ARRIVED" not in row["sql"]
+        or "ROUTE_STARTED" not in row["sql"]
         or "batch_id" not in row["sql"]
         or "rollcall_id" not in row["sql"]
+        or "route_id" not in row["sql"]
     ):
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -539,7 +788,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
                                           'APPLICATION_CHANGE_REJECTED','APPLICATION_CHANGE_CANCELLED',
                                           'APPLICATION_CHANGE_EXPIRED',
                                           'PRESENCE_ARRIVED','PRESENCE_DEPARTED',
-                                          'PRESENCE_CORRECTED','ROLLCALL_TAKEN')),
+                                          'PRESENCE_CORRECTED','ROLLCALL_TAKEN',
+                                          'ROUTE_CREATED','ROUTE_VERSION_PUBLISHED',
+                                          'ROUTE_PAUSED','ROUTE_RESUMED','ROUTE_BOUND',
+                                          'ROUTE_CHECKPOINT_CLOSED','ROUTE_CHECKPOINT_OPENED',
+                                          'ROUTE_STARTED','ROUTE_CHECKPOINT','ROUTE_COMPLETED',
+                                          'ROUTE_VIOLATED','ROUTE_CONFLICT')),
                        ticket_code    TEXT,
                        person_id      TEXT,
                        gate_id        TEXT,
@@ -547,19 +801,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
                        payload        TEXT NOT NULL,
                        batch_id       TEXT,
                        application_id TEXT,
-                       rollcall_id    TEXT
+                       rollcall_id    TEXT,
+                       route_id       TEXT,
+                       route_version  INTEGER,
+                       checkpoint_seq INTEGER,
+                       progress_id    TEXT
                    )"""
             )
-            # 老库可能还没有 batch_id/application_id 列（逐版补齐，列不存在先补 NULL）
+            # 老库可能还没有部分列（逐版补齐，列不存在先补 NULL）
             old_cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
             select_batch = "batch_id" if "batch_id" in old_cols else "NULL"
             select_app = "application_id" if "application_id" in old_cols else "NULL"
+            select_rc = "rollcall_id" if "rollcall_id" in old_cols else "NULL"
+            select_rid = "route_id" if "route_id" in old_cols else "NULL"
+            select_rver = "route_version" if "route_version" in old_cols else "NULL"
+            select_cseq = "checkpoint_seq" if "checkpoint_seq" in old_cols else "NULL"
             conn.execute(
                 f"""INSERT INTO events_new
                        (id,ts,type,ticket_code,person_id,gate_id,reason,payload,
-                        batch_id,application_id,rollcall_id)
+                        batch_id,application_id,rollcall_id,
+                        route_id,route_version,checkpoint_seq,progress_id)
                    SELECT id,ts,type,ticket_code,person_id,gate_id,reason,payload,
-                          {select_batch},{select_app},NULL
+                          {select_batch},{select_app},{select_rc},
+                          {select_rid},{select_rver},{select_cseq},NULL
                      FROM events"""
             )
             conn.execute("DROP TABLE events")
@@ -576,6 +840,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_app ON events(application_id)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_route ON events(route_id)"
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -591,6 +858,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_app ON events(application_id)"
     )
+    # 路线模块的 events 索引（老库 SCHEMA 执行时可能因旧表缺列而跳过，
+    # 重建 events 后在此幂等补建；列不存在则忽略并由下次启动补齐）
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_route ON events(route_id)"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 @contextmanager
@@ -618,12 +893,17 @@ def add_event(
     batch_id: Optional[str] = None,
     application_id: Optional[str] = None,
     rollcall_id: Optional[str] = None,
+    route_id: Optional[str] = None,
+    route_version: Optional[int] = None,
+    checkpoint_seq: Optional[int] = None,
+    progress_id: Optional[str] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO events
                (ts, type, ticket_code, person_id, gate_id, reason, payload,
-                batch_id, application_id, rollcall_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                batch_id, application_id, rollcall_id,
+                route_id, route_version, checkpoint_seq, progress_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             ts,
             event_type,
@@ -635,6 +915,10 @@ def add_event(
             batch_id,
             application_id,
             rollcall_id,
+            route_id,
+            route_version,
+            checkpoint_seq,
+            progress_id,
         ),
     )
     return int(cur.lastrowid)

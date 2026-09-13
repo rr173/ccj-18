@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from . import services
 from . import presence as presence_svc
+from . import routes as routes_svc
 from .db import DB_PATH, connect, init_db, iso, parse_dt, utcnow
 from .services import SWEEP_INTERVAL
 
@@ -117,6 +118,7 @@ class IssueIn(BaseModel):
     ttl_seconds: Optional[int] = Field(default=None, ge=1, le=365 * 24 * 3600)
     note: Optional[str] = Field(default=None, max_length=500)
     zones: Optional[list[str]] = None  # 允许通行的分区；缺省=[] 即所有门点拒绝
+    route_id: Optional[str] = Field(default=None, max_length=64)  # 绑定检查路线
 
 
 class RevokeIn(BaseModel):
@@ -129,6 +131,7 @@ class RedeemIn(BaseModel):
     code: str = Field(min_length=1)
     attempt_id: str = Field(min_length=1, max_length=128)
     policy_version: int = Field(default=0, ge=0)  # 门点已同步的封锁规则版本
+    route_version: int = Field(default=0, ge=0)  # 门点已同步的路线目录版本
 
 
 class SyncIn(BaseModel):
@@ -145,6 +148,7 @@ class BatchIn(BaseModel):
     zone_id: str = Field(min_length=1, max_length=64)
     capacity: int = Field(ge=1, le=100000)
     name: Optional[str] = Field(default=None, max_length=128)
+    route_id: Optional[str] = Field(default=None, max_length=64)  # 绑定检查路线
 
 
 class CapacityIn(BaseModel):
@@ -213,6 +217,68 @@ class RollcallIn(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=300)
     zone_id: Optional[str] = Field(default=None, max_length=64)
     batch_id: Optional[str] = Field(default=None, max_length=64)
+    operator: Optional[str] = Field(default=None, max_length=128)
+
+
+# ---------------- 访客路线检查模型 ----------------
+
+class RouteIn(BaseModel):
+    id: Optional[str] = Field(default=None, max_length=64)
+    zone_id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+
+
+class CheckpointIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    name: Optional[str] = Field(default=None, max_length=128)
+    max_stay_seconds: Optional[int] = Field(default=None, ge=1, le=365 * 24 * 3600)
+
+
+class RouteVersionIn(BaseModel):
+    checkpoints: list[CheckpointIn] = Field(min_length=1, max_length=100)
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+class RoutePauseIn(BaseModel):
+    reason: str = Field(default="admin_pause", max_length=300)
+
+
+class CheckpointStateIn(BaseModel):
+    version: Optional[int] = Field(default=None, ge=1)
+    seq: int = Field(ge=1, le=100)
+    closed: bool
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class RouteBindIn(BaseModel):
+    route_id: str = Field(min_length=1, max_length=64)
+    scope: str = Field(default="TICKET", pattern="^(TICKET|BATCH)$")
+    code: Optional[str] = Field(default=None, max_length=64)
+    batch_id: Optional[str] = Field(default=None, max_length=64)
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class CheckpointScanIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1, max_length=128)
+    route_version: int = Field(default=0, ge=0)  # 门点已同步的路线目录版本
+
+
+class OfflineCheckpointEvent(BaseModel):
+    code: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1, max_length=128)
+    event_ts: Optional[str] = None  # 门点本地事件时间（ISO8601）；缺省=处理时刻
+
+
+class CheckpointReplayIn(BaseModel):
+    gate_id: str = Field(min_length=1, max_length=64)
+    events: list[OfflineCheckpointEvent] = Field(min_length=1, max_length=500)
+
+
+class ConflictResolveIn(BaseModel):
+    action: str = Field(pattern="^(DISMISSED|APPLIED|MARK_VIOLATED)$")
+    reason: Optional[str] = Field(default=None, max_length=300)
     operator: Optional[str] = Field(default=None, max_length=128)
 
 
@@ -375,6 +441,14 @@ def admin_issue_ticket(body: IssueIn, conn: sqlite3.Connection = Depends(get_con
             raise HTTPException(status_code=400, detail=f"未知分区: {z}")
         if z not in zones:
             zones.append(z)
+    if body.route_id:
+        route = routes_svc.get_route(conn, body.route_id)
+        if route is None:
+            raise HTTPException(status_code=400, detail=f"路线不存在: {body.route_id}")
+        if route["zone_id"] not in zones:
+            raise HTTPException(
+                status_code=400,
+                detail=f"路线属于分区 {route['zone_id']}，但票面未授权该分区")
     ticket = services.issue_ticket(
         conn,
         person_id=body.person_id.strip(),
@@ -382,7 +456,13 @@ def admin_issue_ticket(body: IssueIn, conn: sqlite3.Connection = Depends(get_con
         valid_until=iso(vu),
         note=body.note,
         zones=zones,
+        route_id=body.route_id,
     )
+    if ticket.get("http_status") == 400:
+        # 路线暂停/未发布属于与当前状态冲突（不是参数格式问题）
+        detail = ticket["error"]
+        code_status = 409 if ("暂停" in detail or "未发布" in detail) else 400
+        raise HTTPException(status_code=code_status, detail=detail)
     return ticket
 
 
@@ -479,7 +559,12 @@ def admin_create_batch(body: BatchIn, conn: sqlite3.Connection = Depends(get_con
         zone_id=body.zone_id,
         capacity=body.capacity,
         name=body.name.strip() if body.name else None,
+        route_id=body.route_id,
     )
+    if batch.get("http_status") == 400:
+        raise HTTPException(status_code=400, detail=batch["error"])
+    if batch.get("http_status") == 409:
+        raise HTTPException(status_code=409, detail=batch["error"])
     conn.commit()
     return batch
 
@@ -770,6 +855,202 @@ def admin_rollcall_detail(rc_id: str, conn: sqlite3.Connection = Depends(get_con
     return rc
 
 
+# ---------------- 访客路线编排 / 绑定 / 监控（管理端） ----------------
+
+def _route_operator(body=None) -> str:
+    val = getattr(body, "operator", None) if body is not None else None
+    return f"admin:{val.strip()}" if val and val.strip() else "admin"
+
+
+@app.post("/api/admin/routes", dependencies=[Depends(require_admin)])
+def admin_create_route(body: RouteIn, conn: sqlite3.Connection = Depends(get_conn)):
+    result = routes_svc.create_route(
+        conn, zone_id=body.zone_id, name=body.name.strip(),
+        operator="admin", route_id=body.id.strip() if body.id else None)
+    status = result.pop("http_status", 201)
+    if status == 400:
+        raise HTTPException(status_code=400, detail=result["error"])
+    if status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.get("/api/admin/routes", dependencies=[Depends(require_admin)])
+def admin_list_routes(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"routes": routes_svc.list_routes(conn),
+            "summary": routes_svc.route_monitoring_summary(conn)}
+
+
+@app.get("/api/admin/routes/{route_id}", dependencies=[Depends(require_admin)])
+def admin_route_detail(route_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = routes_svc.route_detail(conn, route_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="路线不存在")
+    return detail
+
+
+@app.post("/api/admin/routes/{route_id}/versions",
+          dependencies=[Depends(require_admin)])
+def admin_publish_route_version(
+    route_id: str, body: RouteVersionIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """发布不可变新版本（替换未来使用；在途执行继续走原版本）。"""
+    result = routes_svc.publish_route_version(
+        conn,
+        route_id=route_id,
+        checkpoints=[cp.model_dump() for cp in body.checkpoints],
+        note=body.note,
+        operator="admin",
+    )
+    status = result.pop("http_status", 201)
+    if status in (400, 404, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.post("/api/admin/routes/{route_id}/pause",
+          dependencies=[Depends(require_admin)])
+def admin_pause_route(
+    route_id: str, body: RoutePauseIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    result = routes_svc.pause_route(
+        conn, route_id=route_id, reason=body.reason, operator="admin")
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.post("/api/admin/routes/{route_id}/resume",
+          dependencies=[Depends(require_admin)])
+def admin_resume_route(
+    route_id: str, body: RoutePauseIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    result = routes_svc.resume_route(
+        conn, route_id=route_id, reason=body.reason, operator="admin")
+    if result["http_status"] == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    conn.commit()
+    result.pop("http_status", None)
+    return result
+
+
+@app.put("/api/admin/routes/{route_id}/checkpoints",
+         dependencies=[Depends(require_admin)])
+def admin_set_checkpoint_closed(
+    route_id: str, body: CheckpointStateIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """打开/关闭某版本上的检查点（在途访客同样受“已关闭检查点拒绝”约束）。"""
+    result = routes_svc.set_checkpoint_closed(
+        conn, route_id=route_id, version=body.version, seq=body.seq,
+        closed=body.closed, reason=body.reason, operator="admin")
+    status = result.pop("http_status", 200)
+    if status in (400, 404):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
+@app.post("/api/admin/routes/bindings", dependencies=[Depends(require_admin)])
+def admin_bind_route(body: RouteBindIn, conn: sqlite3.Connection = Depends(get_conn)):
+    """把路线绑定到新签发的票（尚未开始）或预约批次（未来使用）。"""
+    result = routes_svc.bind_route(
+        conn,
+        route_id=body.route_id,
+        scope=body.scope,
+        code=body.code,
+        batch_id=body.batch_id,
+        operator="admin",
+        reason=body.reason,
+    )
+    status = result.pop("http_status", 200)
+    if status in (400, 404, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
+@app.get("/api/admin/route-progress", dependencies=[Depends(require_admin)])
+def admin_route_progress(
+    status_filter: str = Query(default="", alias="status"),
+    zone_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    route_id: Optional[str] = Query(default=None),
+    overdue: bool = Query(default=False),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """路线执行监控：当前所在检查点 / 超时停留 / 已完成 / 违规（可多维过滤）。"""
+    rows = routes_svc.list_progress(
+        conn,
+        status_filter=(status_filter.strip().upper() or None),
+        zone_id=zone_id, batch_id=batch_id, person_id=person_id,
+        route_id=route_id, overdue_only=overdue)
+    return {"count": len(rows), "progress": rows,
+            "summary": routes_svc.route_monitoring_summary(conn)}
+
+
+@app.get("/api/admin/route-progress/{code}", dependencies=[Depends(require_admin)])
+def admin_route_progress_detail(code: str, conn: sqlite3.Connection = Depends(get_conn)):
+    detail = routes_svc.progress_detail(conn, code)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="票面或路线执行不存在")
+    return detail
+
+
+@app.get("/api/admin/route-checks", dependencies=[Depends(require_admin)])
+def admin_route_checks(
+    gate_id: Optional[str] = Query(default=None),
+    route_id: Optional[str] = Query(default=None),
+    code: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    decision: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"checks": routes_svc.list_checks(
+        conn, gate_id=gate_id, route_id=route_id, code=code,
+        person_id=person_id, decision=decision)}
+
+
+@app.get("/api/admin/route-conflicts", dependencies=[Depends(require_admin)])
+def admin_route_conflicts(
+    status_filter: str = Query(default="OPEN", alias="status"),
+    zone_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
+    person_id: Optional[str] = Query(default=None),
+    route_id: Optional[str] = Query(default=None),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """离线补齐冲突队列（默认只看待处理）。"""
+    return {"conflicts": routes_svc.list_conflicts(
+        conn, status_filter=status_filter.upper(), zone_id=zone_id,
+        batch_id=batch_id, person_id=person_id, route_id=route_id)}
+
+
+@app.post("/api/admin/route-conflicts/{conflict_id}/resolve",
+          dependencies=[Depends(require_admin)])
+def admin_resolve_route_conflict(
+    conflict_id: int, body: ConflictResolveIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """管理员处理离线冲突：DISMISSED / APPLIED / MARK_VIOLATED（记录保留）。"""
+    result = routes_svc.resolve_conflict(
+        conn, conflict_id=conflict_id, action=body.action,
+        operator=_route_operator(body), reason=body.reason)
+    status = result.pop("http_status", 200)
+    if status in (400, 404, 409):
+        raise HTTPException(status_code=status, detail=result["error"])
+    conn.commit()
+    return result
+
+
 # ---------------- 访客预约（公开：凭链接令牌，无 Bearer） ----------------
 @app.get("/api/public/batches/{token}")
 def public_batch(token: str, conn: sqlite3.Connection = Depends(get_conn)):
@@ -875,6 +1156,7 @@ def gate_redeem(
         gate_id=body.gate_id,
         attempt_id=body.attempt_id,
         policy_version=body.policy_version,
+        route_version=body.route_version,
     )
     return JSONResponse(status_code=result["http_status"], content=result["response"])
 
@@ -906,6 +1188,49 @@ def gate_departure(
     )
     return JSONResponse(
         status_code=result["http_status"], content=result["response"])
+
+
+@app.post("/api/gate/checkpoint", dependencies=[Depends(require_gate)])
+def gate_checkpoint(
+    body: CheckpointScanIn,
+    gate=Depends(require_active_gate),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """门点上报一次路线检查点经过（已开始路线的逐点推进）。
+
+    同一 (gate_id, attempt_id) 网络抖动重发幂等，绝不重复推进；
+    跳过/重复进入/进入已关闭检查点/停留超时均给出门点可直接亮灯的明确结论。
+    """
+    result = routes_svc.gate_checkpoint(
+        conn,
+        gate_id=body.gate_id,
+        raw_code=body.code,
+        attempt_id=body.attempt_id,
+        client_route_version=body.route_version,
+    )
+    return JSONResponse(
+        status_code=result["http_status"], content=result["response"])
+
+
+@app.post("/api/gate/checkpoints/replay", dependencies=[Depends(require_gate)])
+def gate_checkpoint_replay(
+    body: CheckpointReplayIn,
+    gate=Depends(require_active_gate),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """门点离线期间攒下的检查点事件：重连时按版本/顺序批量补齐。
+
+    无法自动裁决的（缺口、迟到、终态后到达、时间戳异常等）不静默丢弃也不
+    擅自推进，而是保留冲突记录（route_event_conflicts + ROUTE_CONFLICT 事件）
+    交管理员处理；每条事件都返回独立结论。
+    """
+    result = routes_svc.replay_checkpoint_events(
+        conn,
+        gate_id=body.gate_id,
+        events=[e.model_dump() for e in body.events],
+    )
+    conn.commit()
+    return result
 
 
 @app.get("/api/gate/heartbeat/{gate_id}", dependencies=[Depends(require_gate)])
